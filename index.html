@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="theme-color" content="#111827" />
+<link rel="manifest" href="manifest.webmanifest" />
+<title>Arena Football GM</title>
+<style>
+:root { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color-scheme: dark; }
+body { margin:0; background:#111827; color:#f3f4f6; }
+header { display:flex; justify-content:space-between; align-items:center; padding:14px 18px; background:#0b1220; border-bottom:1px solid #263244; position:sticky; top:0; z-index:2; }
+h1 { font-size:20px; margin:0; }
+nav { display:flex; overflow-x:auto; gap:8px; padding:10px; background:#172033; position:sticky; top:52px; z-index:1; }
+button, select { background:#24324b; color:#fff; border:1px solid #3b4a66; border-radius:8px; padding:9px 11px; }
+button.active { background:#2563eb; }
+button:disabled { opacity:.5; }
+main { padding:14px; max-width:980px; margin:auto; }
+.card { background:#182235; border:1px solid #2a3851; border-radius:12px; padding:14px; margin-bottom:14px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; }
+table { width:100%; border-collapse:collapse; font-size:14px; }
+th, td { text-align:left; padding:8px 6px; border-bottom:1px solid #2b3850; }
+.muted { color:#9ca3af; }
+.good { color:#86efac; }.bad { color:#fca5a5; }
+.score { font-size:34px; font-weight:800; }
+.log { max-height:360px; overflow:auto; background:#0d1525; padding:10px; border-radius:8px; font-family:ui-monospace,monospace; font-size:12px; line-height:1.5; }
+.actions { display:flex; flex-wrap:wrap; gap:8px; }
+
+/* iOS/offline additions */
+html { -webkit-text-size-adjust: 100%; }
+body { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+button, select { min-height: 44px; font-size: 16px; }
+header { padding-top: max(12px, env(safe-area-inset-top)); }
+.log { -webkit-overflow-scrolling: touch; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Arena Football GM</h1>
+  <span id="saveStatus">Starting…</span>
+</header>
+<nav id="tabs"></nav>
+<main id="app"></main>
+<script>
+const uid = (prefix="id") => `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
+const clamp = (n,min,max) => Math.max(min,Math.min(max,n));
+const randInt = (min,max) => Math.floor(Math.random()*(max-min+1))+min;
+const choice = arr => arr[Math.floor(Math.random()*arr.length)];
+const weighted = entries => {
+  const total = entries.reduce((s,[,w])=>s+w,0); let r=Math.random()*total;
+  for (const [v,w] of entries) { r-=w; if (r<=0) return v; }
+  return entries.at(-1)[0];
+};
+const deepClone = obj => JSON.parse(JSON.stringify(obj));
+const DEFAULT_RULES = {
+  name: "Generic Arena",
+  fieldLength: 50,
+  endZoneLength: 8,
+  downs: 4,
+  firstDownDistance: 10,
+  quarterMinutes: 15,
+  playersOnField: 8,
+  kickoffSpot: 0,
+  touchbackSpot: 5,
+  kickoffOutOfBoundsSpot: 20,
+  rouge: false,
+  reboundNets: true,
+  wallsInPlay: true,
+  motion: { offensivePlayers: 1, forwardMotionAllowed: true },
+  clock: { stopOnIncomplete: true, stopOnOutOfBounds: true, firstHalfFinalMinute: 60, secondHalfFinalMinute: 60 },
+  overtime: { enabled: true, possessionsEach: 1, suddenDeathAfter: true, maxPeriods: 3 },
+  penalties: { enabled: true, offensiveRate: 0.045, defensiveRate: 0.04 },
+  injuries: { enabled: true, perSnapRate: 0.0015 },
+  scoring: { td: 6, xp1: 1, xp2: 2, fg: 3, safety: 2 }
+};
+
+const TEAM_TEMPLATES = [
+  ["Philadelphia Soul", "PHI"], ["Albany Firebirds", "ALB"],
+  ["Orlando Predators", "ORL"], ["Arizona Rattlers", "ARI"],
+  ["Chicago Rush", "CHI"], ["San Jose SaberCats", "SJS"],
+  ["Tampa Bay Storm", "TBS"], ["Iowa Barnstormers", "IOW"]
+];
+
+const POSITIONS = ["QB","FB","WR","WR","OL","OL","OL","DL","DL","LB","DB","DB","DB","K"];
+
+const first=["Jay","Marcus","Derek","Chris","Andre","Ty","Malik","Jordan","Dante","Cam","Devin","Trey","Nate","Isaiah"];
+const last=["Johnson","Williams","Davis","Brown","Miller","Wilson","Moore","Taylor","Anderson","Thomas","Jackson","White","Harris","Martin"];
+
+function createPlayer(position, teamId) {
+  const age=randInt(21,33);
+  const base=randInt(42,78);
+  const p={ id:uid('p'), teamId, name:`${first[randInt(0,first.length-1)]} ${last[randInt(0,last.length-1)]}`, position, age,
+    ratings:{ overall:base, speed:clamp(base+randInt(-12,12),30,95), strength:clamp(base+randInt(-12,12),30,95), skill:clamp(base+randInt(-10,14),30,95), awareness:clamp(base+randInt(-12,12),30,95) },
+    fatigue:0, injuredGames:0, stats:emptyStats() };
+  if(position==='QB') p.ratings.skill=clamp(base+8,45,95);
+  if(position==='K') p.ratings.skill=clamp(base+10,45,95);
+  return p;
+}
+function emptyStats(){return {gp:0,passAtt:0,passCmp:0,passYds:0,passTD:0,int:0,rushAtt:0,rushYds:0,rushTD:0,rec:0,recYds:0,recTD:0,tackles:0,sacks:0,defInt:0,ff:0,fr:0,kr:0,krYds:0,krTD:0,fgm:0,fga:0,xpm:0,xpa:0};}
+function generateRoster(teamId){return POSITIONS.map(pos=>createPlayer(pos,teamId));}
+function developRoster(players){
+  for(const p of players){
+    p.age++;
+    const delta=p.age<=25?randInt(-1,4):p.age<=29?randInt(-2,2):randInt(-4,1);
+    for(const key of Object.keys(p.ratings)) p.ratings[key]=clamp(p.ratings[key]+delta,25,99);
+    p.fatigue=0; p.injuredGames=Math.max(0,p.injuredGames-1);
+  }
+}
+function depthChart(roster){
+  const byPos={};
+  for(const p of roster){ (byPos[p.position]??=[]).push(p); }
+  for(const list of Object.values(byPos)) list.sort((a,b)=>b.ratings.overall-a.ratings.overall);
+  return byPos;
+}
+
+function createUniverse(name='Arena Universe'){
+  return { id:uid('u'), name, createdAt:new Date().toISOString(), activeLeagueId:null, leagues:[], history:[], version:2 };
+}
+function createLeague(universe,{name='Arena League',teamCount=4,rules=DEFAULT_RULES}={}){
+  const league={ id:uid('lg'), name, season:2026, rules:deepClone(rules), teams:[], schedule:[], completedSeasons:[] };
+  for(let i=0;i<teamCount;i++){
+    const [name,abbr]=TEAM_TEMPLATES[i%TEAM_TEMPLATES.length]; const id=uid('t');
+    league.teams.push({ id,name,abbr,roster:generateRoster(id), wins:0,losses:0,ties:0,pf:0,pa:0, gamesPlayed:0 });
+  }
+  league.schedule=generateSchedule(league.teams,league.season);
+  universe.leagues.push(league); universe.activeLeagueId ??= league.id;
+  return league;
+}
+function generateSchedule(teams,season){
+  const games=[]; let week=1;
+  for(let round=0;round<2;round++){
+    for(let i=0;i<teams.length;i++) for(let j=i+1;j<teams.length;j++){
+      const home=round===0?teams[i]:teams[j], away=round===0?teams[j]:teams[i];
+      games.push({id:uid('g'),season,week:week++,homeId:home.id,awayId:away.id,played:false,homeScore:null,awayScore:null,boxScore:null,events:null});
+    }
+  }
+  return games;
+}
+function standings(league){
+  return [...league.teams].sort((a,b)=>(b.wins-b.losses)-(a.wins-a.losses)|| (b.pf-b.pa)-(a.pf-a.pa));
+}
+function recordResult(league,game,result){
+  if(game.played) return;
+  game.played=true; game.homeScore=result.homeScore; game.awayScore=result.awayScore; game.boxScore=result.boxScore; game.events=result.events;
+  const h=league.teams.find(t=>t.id===game.homeId), a=league.teams.find(t=>t.id===game.awayId);
+  h.gamesPlayed++; a.gamesPlayed++; h.pf+=result.homeScore; h.pa+=result.awayScore; a.pf+=result.awayScore; a.pa+=result.homeScore;
+  if(result.homeScore>result.awayScore){h.wins++;a.losses++;} else if(result.awayScore>result.homeScore){a.wins++;h.losses++;} else {h.ties++;a.ties++;}
+}
+function advanceSeason(league){
+  if(league.schedule.some(g=>!g.played)) throw new Error('Finish all games first.');
+  league.completedSeasons.push({season:league.season,standings:standings(league).map(t=>({teamId:t.id,w:t.wins,l:t.losses,t:t.ties,pf:t.pf,pa:t.pa}))});
+  league.season++;
+  for(const t of league.teams){ developRoster(t.roster); Object.assign(t,{wins:0,losses:0,ties:0,pf:0,pa:0,gamesPlayed:0}); }
+  league.schedule=generateSchedule(league.teams,league.season);
+}
+
+function available(list){ return (list||[]).filter(p=>p.injuredGames<=0).sort((a,b)=>b.ratings.overall-a.ratings.overall); }
+function starters(team){
+  const d=depthChart(team.roster);
+  return {
+    qb:available(d.QB)[0], fb:available(d.FB)[0], wr:available(d.WR).slice(0,2),
+    ol:available(d.OL).slice(0,3), k:available(d.K)[0],
+    db:available(d.DB).slice(0,3), dl:available(d.DL).slice(0,2), lb:available(d.LB)[0]
+  };
+}
+function avg(list,key='overall',fallback=45){
+  const vals=(list||[]).filter(Boolean).map(p=>p.ratings?.[key]??p.ratings?.overall??fallback);
+  return vals.length?vals.reduce((a,b)=>a+b,0)/vals.length:fallback;
+}
+function fatiguePenalty(p){ return p?Math.min(16,(p.fatigue||0)*0.22):8; }
+function effective(p,key='overall'){ return p?clamp((p.ratings?.[key]??p.ratings?.overall??45)-fatiguePenalty(p),20,99):35; }
+function addStat(p,key,n=1){ if(p){p.stats??=emptyStats();p.stats[key]=(p.stats[key]||0)+n;} }
+function teamSideBox(teamId,home,box){ return teamId===home.id?box.home:box.away; }
+function normalizeRules(rules){
+  const r={...deepClone(DEFAULT_RULES),...(rules||{})};
+  r.motion={...DEFAULT_RULES.motion,...(rules?.motion||{})};
+  r.clock={...DEFAULT_RULES.clock,...(rules?.clock||{})};
+  r.overtime={...DEFAULT_RULES.overtime,...(rules?.overtime||{})};
+  r.penalties={...DEFAULT_RULES.penalties,...(rules?.penalties||{})};
+  r.injuries={...DEFAULT_RULES.injuries,...(rules?.injuries||{})};
+  r.scoring={...DEFAULT_RULES.scoring,...(rules?.scoring||{})};
+  return r;
+}
+function scoreDiff(state,teamId,home){ return teamId===home.id?state.homeScore-state.awayScore:state.awayScore-state.homeScore; }
+function coachDecision(state,team,home,rules){
+  const distGoal=rules.fieldLength-state.yardLine, diff=scoreDiff(state,team.id,home);
+  const late=state.quarter>=4 && state.seconds<=180;
+  if(state.down===rules.downs){
+    const fgDist=distGoal+8;
+    const desperate=late && diff<0;
+    if(!desperate && fgDist<=34 && state.yardLine>=14) return 'FG';
+    if(state.toGo<=3 || desperate || state.yardLine>=30) return state.toGo<=1?'RUN_INSIDE':'PASS_SHORT';
+    return 'TURNOVER';
+  }
+  if(late && diff<=-8) return weighted([['PASS_SHORT',4],['PASS_MEDIUM',5],['PASS_DEEP',2]]);
+  if(state.toGo>=11) return weighted([['PASS_SHORT',4],['PASS_MEDIUM',5],['PASS_DEEP',1],['RUN_OUTSIDE',1]]);
+  if(state.down===3 && state.toGo>=6) return weighted([['PASS_SHORT',5],['PASS_MEDIUM',4],['PASS_DEEP',1]]);
+  if(state.yardLine>=rules.fieldLength-8) return weighted([['RUN_INSIDE',3],['PASS_SHORT',5],['PASS_MEDIUM',2]]);
+  return weighted([['RUN_INSIDE',22],['RUN_OUTSIDE',13],['PASS_SHORT',35],['PASS_MEDIUM',23],['PASS_DEEP',7]]);
+}
+function offenseProfile(s,play){
+  const qbSkill=effective(s.qb,'skill'), qbAw=effective(s.qb,'awareness');
+  const wrSkill=avg(s.wr,'skill'), wrSpeed=avg(s.wr,'speed'), fb=effective(s.fb,'overall');
+  const ol=avg(s.ol,'strength');
+  if(play.startsWith('RUN')) return .46*fb+.30*ol+.12*qbAw+.12*effective(s.fb,'speed');
+  const depth=play==='PASS_DEEP'?1.10:play==='PASS_MEDIUM'?1.04:.98;
+  return (.43*qbSkill+.18*qbAw+.25*wrSkill+.14*wrSpeed)*depth;
+}
+function defenseProfile(s,play){
+  const front=.55*avg(s.dl,'strength')+.45*(s.lb?effective(s.lb,'overall'):45);
+  const coverage=.55*avg(s.db,'awareness')+.45*avg(s.db,'speed');
+  if(play.startsWith('RUN')) return .68*front+.32*avg(s.db,'overall');
+  return play==='PASS_DEEP'?.78*coverage+.22*front:.67*coverage+.33*front;
+}
+function selectReceiver(off,play){
+  const list=off.wr.length?off.wr:[off.fb].filter(Boolean);
+  if(!list.length)return null;
+  if(play==='PASS_DEEP') return list.slice().sort((a,b)=>effective(b,'speed')-effective(a,'speed'))[0];
+  return weighted(list.map((p,i)=>[p,i===0?3:2]));
+}
+function selectDefender(def,group='DB'){
+  const list=group==='DL'?def.dl:group==='LB'?[def.lb].filter(Boolean):def.db;
+  return list.length?choice(list):choice([...def.db,...def.dl,def.lb].filter(Boolean));
+}
+function runSnap(off,def,play){
+  const edge=offenseProfile(off,play)-defenseProfile(def,play);
+  const outside=play==='RUN_OUTSIDE';
+  const burst=Math.random()<clamp(.08+edge/500,.04,.18);
+  const stuffed=Math.random()<clamp(.18-edge/450,.08,.32);
+  let yards=stuffed?randInt(-3,1):outside?randInt(1,8):randInt(0,7);
+  if(burst) yards+=randInt(5,14);
+  yards+=Math.round(edge/18);
+  yards=clamp(yards,-5,24);
+  const fumbleChance=clamp(.018+(off.fb?fatiguePenalty(off.fb)/700:0)-effective(off.fb,'awareness')/6000,.006,.045);
+  const fumble=Math.random()<fumbleChance;
+  return {type:'run',yards,complete:true,outOfBounds:outside&&Math.random()<.18,fumble,carrier:off.fb,desc:`${outside?'Outside':'Inside'} run for ${yards} yard${Math.abs(yards)===1?'':'s'}`};
+}
+function passSnap(off,def,play){
+  const edge=offenseProfile(off,play)-defenseProfile(def,play);
+  const qb=off.qb, rec=selectReceiver(off,play);
+  const rush=avg(def.dl,'overall')+(def.lb?effective(def.lb,'overall')*.35:0);
+  const protection=avg(off.ol,'strength')+(qb?effective(qb,'awareness')*.25:0);
+  const sackChance=clamp(.075+(rush-protection)/480,.025,.19);
+  const intBase=play==='PASS_DEEP'?.075:play==='PASS_MEDIUM'?.052:.032;
+  const intChance=clamp(intBase-edge/900+(70-(qb?effective(qb,'awareness'):40))/2500,.012,.13);
+  const compBase=play==='PASS_DEEP'?.42:play==='PASS_MEDIUM'?.57:.72;
+  const compChance=clamp(compBase+edge/210,.28,.86);
+  const r=Math.random();
+  if(r<sackChance){const y=-randInt(2,8);return{type:'pass',yards:y,sack:true,qb,defender:selectDefender(def,'DL'),desc:`Sacked for ${Math.abs(y)} yard loss`};}
+  if(r<sackChance+intChance){return{type:'pass',yards:0,turnover:true,interception:true,qb,defender:selectDefender(def,'DB'),desc:'Pass intercepted'};}
+  if(r<sackChance+intChance+compChance){
+    let y=play==='PASS_DEEP'?randInt(12,26):play==='PASS_MEDIUM'?randInt(7,16):randInt(1,10);
+    if(Math.random()<clamp(.08+(rec?effective(rec,'speed'):45)/900,.08,.19))y+=randInt(5,15);
+    y=clamp(y,0,34);
+    const fumbleChance=clamp(.009+(rec?fatiguePenalty(rec)/1000:0),.004,.025);
+    return{type:'pass',yards:y,complete:true,receiver:rec,qb,fumble:Math.random()<fumbleChance,outOfBounds:Math.random()<.13,desc:`Pass complete for ${y} yards`};
+  }
+  return{type:'pass',yards:0,incomplete:true,qb,receiver:rec,desc:'Incomplete pass'};
+}
+function fieldGoalChance(k,distance){
+  const skill=effective(k,'skill');
+  return clamp(.94-(distance-18)*.026+(skill-65)*.006,.08,.98);
+}
+function kickoff(offTeam,defTeam,off,def,rules,state,events,box,home){
+  const returner=off.wr.slice().sort((a,b)=>effective(b,'speed')-effective(a,'speed'))[0]||off.fb;
+  const kickSkill=effective(def.k,'skill');
+  const touchbackChance=clamp(.18+(kickSkill-60)*.006,.06,.48);
+  if(Math.random()<touchbackChance){
+    state.yardLine=rules.touchbackSpot;events.push(`Q${state.quarter} ${fmt(state.seconds)} ${defTeam.abbr} kickoff: touchback, ${offTeam.abbr} starts at ${state.yardLine}`);return;
+  }
+  let ret=randInt(6,18)+Math.round((effective(returner,'speed')-65)/8);
+  let net=false;
+  if(rules.reboundNets && Math.random()<.16){ret+=randInt(3,12);net=true;}
+  ret=clamp(ret,1,rules.fieldLength-1);
+  state.yardLine=ret; addStat(returner,'kr'); addStat(returner,'krYds',ret);
+  teamSideBox(offTeam.id,home,box).kickReturnYds+=ret;
+  events.push(`Q${state.quarter} ${fmt(state.seconds)} ${defTeam.abbr} kickoff${net?' off the rebound net':''}; ${offTeam.abbr} return to ${state.yardLine}`);
+}
+function maybePenalty(offTeam,defTeam,rules){
+  if(!rules.penalties.enabled)return null;
+  const r=Math.random();
+  if(r<rules.penalties.offensiveRate) return choice([{side:'offense',name:'False start',yards:5,noPlay:true},{side:'offense',name:'Holding',yards:10,noPlay:false}]);
+  if(r<rules.penalties.offensiveRate+rules.penalties.defensiveRate) return choice([{side:'defense',name:'Illegal contact',yards:5,automaticFirst:true},{side:'defense',name:'Defensive holding',yards:5,automaticFirst:true},{side:'defense',name:'Pass interference',yards:10,automaticFirst:true}]);
+  return null;
+}
+function applyFatigueAndInjuries(offTeam,defTeam,off,def,rules,events,state){
+  const participants=[off.qb,off.fb,...off.wr,...off.ol,...def.db,...def.dl,def.lb].filter(Boolean);
+  participants.forEach(p=>p.fatigue=clamp((p.fatigue||0)+randInt(1,3),0,100));
+  if(!rules.injuries.enabled || Math.random()>rules.injuries.perSnapRate)return;
+  const p=choice(participants); if(!p)return;
+  p.injuredGames=Math.max(p.injuredGames||0,Math.random()<.8?1:randInt(2,4));
+  events.push(`Q${state.quarter} ${fmt(state.seconds)} INJURY: ${p.name} (${p.position}) will miss ${p.injuredGames} game${p.injuredGames===1?'':'s'}`);
+}
+function playClockRunoff(state,result,rules){
+  if(result?.incomplete && rules.clock.stopOnIncomplete)return randInt(5,9);
+  if(result?.outOfBounds && rules.clock.stopOnOutOfBounds)return randInt(8,14);
+  return randInt(22,38);
+}
+function conversionDecision(state,teamId,home){
+  const diff=scoreDiff(state,teamId,home),late=state.quarter>=4&&state.seconds<=300;
+  if(late && [-2,-5,-8,-11].includes(diff))return 2;
+  return Math.random()<.08?2:1;
+}
+function attemptConversion(offTeam,defTeam,off,def,state,rules,home,events){
+  const kind=conversionDecision(state,offTeam.id,home);
+  if(kind===1){
+    addStat(off.k,'xpa'); const good=Math.random()<clamp(.90+(effective(off.k,'skill')-65)*.004,.68,.98);
+    if(good){addStat(off.k,'xpm');if(offTeam.id===home.id)state.homeScore+=rules.scoring.xp1;else state.awayScore+=rules.scoring.xp1;}
+    events.push(`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr} 1-point try ${good?'GOOD':'NO GOOD'}`);
+  }else{
+    const play=weighted([['RUN_INSIDE',2],['PASS_SHORT',6],['PASS_MEDIUM',2]]),res=play.startsWith('RUN')?runSnap(off,def,play):passSnap(off,def,play);
+    const good=!res.turnover&&!res.incomplete&&!res.sack&&res.yards>=3;
+    if(good){if(offTeam.id===home.id)state.homeScore+=rules.scoring.xp2;else state.awayScore+=rules.scoring.xp2;}
+    events.push(`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr} 2-point try ${good?'GOOD':'NO GOOD'}`);
+  }
+}
+function simulateGame(home,away,inputRules,{maxEvents=900}={}){
+  const rules=normalizeRules(inputRules), H=starters(home), A=starters(away), lineups={[home.id]:H,[away.id]:A};
+  for(const t of [home,away]) for(const p of t.roster){ p.stats??=emptyStats(); p.stats.gp=(p.stats.gp||0)+1; p.fatigue=clamp((p.fatigue||0)*.35,0,100); }
+  const box={
+    home:{firstDowns:0,totalYds:0,rushYds:0,passYds:0,turnovers:0,sacksAllowed:0,penalties:0,penaltyYds:0,kickReturnYds:0,possessions:0},
+    away:{firstDowns:0,totalYds:0,rushYds:0,passYds:0,turnovers:0,sacksAllowed:0,penalties:0,penaltyYds:0,kickReturnYds:0,possessions:0}
+  };
+  const events=['--- START GAME ---'];
+  let state={quarter:1,seconds:rules.quarterMinutes*60,offenseId:away.id,defenseId:home.id,down:1,toGo:rules.firstDownDistance,yardLine:rules.touchbackSpot,homeScore:0,awayScore:0,overtime:false,otPossessions:{[home.id]:0,[away.id]:0}};
+  const score=(teamId,pts)=>{if(teamId===home.id)state.homeScore+=pts;else state.awayScore+=pts;};
+  const teams=id=>id===home.id?home:away;
+  const resetPossession=(newOffenseId,spot=null,kick=false)=>{
+    const oldDefense=newOffenseId===home.id?away:home, newOff=teams(newOffenseId);
+    state.offenseId=newOffenseId;state.defenseId=oldDefense.id;state.down=1;state.toGo=rules.firstDownDistance;state.yardLine=spot??rules.touchbackSpot;
+    teamSideBox(newOffenseId,home,box).possessions++;
+    if(kick) kickoff(newOff,oldDefense,lineups[newOff.id],lineups[oldDefense.id],rules,state,events,box,home);
+  };
+  resetPossession(away.id,rules.touchbackSpot,true);
+  let count=0;
+  while(count++<maxEvents){
+    if(!state.overtime && state.quarter>4)break;
+    if(state.seconds<=0){
+      if(!state.overtime){
+        if(state.quarter<4){state.quarter++;state.seconds=rules.quarterMinutes*60;events.push(`--- Q${state.quarter} ---`);continue;}
+        if(state.homeScore!==state.awayScore || !rules.overtime.enabled)break;
+        state.overtime=true;state.quarter=5;state.seconds=rules.quarterMinutes*60;events.push('--- OVERTIME ---');resetPossession(Math.random()<.5?home.id:away.id,rules.touchbackSpot,true);continue;
+      }else{break;}
+    }
+    const offTeam=teams(state.offenseId), defTeam=teams(state.defenseId), off=lineups[offTeam.id], def=lineups[defTeam.id], statBox=teamSideBox(offTeam.id,home,box);
+    const before={...state};
+    const play=coachDecision(state,offTeam,home,rules);
+    if(play==='TURNOVER'){
+      events.push(`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr} punts/cedes possession on 4th down`);
+      state.seconds=Math.max(0,state.seconds-randInt(16,24)); const newSpot=clamp(rules.fieldLength-state.yardLine,rules.touchbackSpot,rules.fieldLength-rules.touchbackSpot);resetPossession(defTeam.id,newSpot,false);continue;
+    }
+    if(play==='FG'){
+      const distance=(rules.fieldLength-state.yardLine)+8,good=Math.random()<fieldGoalChance(off.k,distance);addStat(off.k,'fga');
+      if(good){addStat(off.k,'fgm');score(offTeam.id,rules.scoring.fg);events.push(`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr} FIELD GOAL GOOD (${distance} yd)`);}
+      else events.push(`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr} field goal MISSED (${distance} yd)`);
+      state.seconds=Math.max(0,state.seconds-randInt(18,28)); if(state.overtime)state.otPossessions[offTeam.id]++; resetPossession(defTeam.id,rules.touchbackSpot,true);continue;
+    }
+    const pen=maybePenalty(offTeam,defTeam,rules);
+    if(pen?.noPlay){
+      statBox.penalties++;statBox.penaltyYds+=pen.yards;state.yardLine=clamp(state.yardLine-pen.yards,0,rules.fieldLength-1);state.toGo=Math.min(rules.fieldLength-state.yardLine,state.toGo+pen.yards);state.seconds=Math.max(0,state.seconds-randInt(4,8));events.push(`Q${state.quarter} ${fmt(before.seconds)} ${offTeam.abbr}: ${pen.name}, ${pen.yards} yards (no play)`);continue;
+    }
+    const result=play.startsWith('RUN')?runSnap(off,def,play):passSnap(off,def,play);
+    if(play.startsWith('RUN')){addStat(result.carrier,'rushAtt');addStat(result.carrier,'rushYds',result.yards);statBox.rushYds+=result.yards;}
+    else{
+      addStat(off.qb,'passAtt');
+      if(result.complete){addStat(off.qb,'passCmp');addStat(off.qb,'passYds',result.yards);addStat(result.receiver,'rec');addStat(result.receiver,'recYds',result.yards);statBox.passYds+=result.yards;}
+      if(result.interception){addStat(off.qb,'int');addStat(result.defender,'defInt');}
+      if(result.sack){addStat(result.defender,'sacks');statBox.sacksAllowed++;}
+    }
+    let gained=result.yards;
+    if(pen){
+      const penBox=pen.side==='offense'?statBox:teamSideBox(defTeam.id,home,box);penBox.penalties++;penBox.penaltyYds+=pen.yards;
+      if(pen.side==='offense'){gained-=pen.yards;events.push(`Q${state.quarter} ${fmt(before.seconds)} ${offTeam.abbr}: ${result.desc}; ${pen.name} -${pen.yards}`);}
+      else{gained=Math.max(gained,pen.yards);events.push(`Q${state.quarter} ${fmt(before.seconds)} ${offTeam.abbr}: ${result.desc}; ${pen.name} +${pen.yards}`);}
+    }else events.push(`Q${before.quarter} ${fmt(before.seconds)} ${offTeam.abbr} ${before.down}&${before.toGo} @${before.yardLine}: ${result.desc}`);
+    statBox.totalYds+=gained;
+    if(result.interception){statBox.turnovers++;state.seconds=Math.max(0,state.seconds-playClockRunoff(state,result,rules));const newSpot=clamp(rules.fieldLength-state.yardLine,rules.touchbackSpot,rules.fieldLength-rules.touchbackSpot);if(state.overtime)state.otPossessions[offTeam.id]++;resetPossession(defTeam.id,newSpot,false);continue;}
+    state.yardLine+=gained;state.toGo-=gained;
+    if(result.fumble){
+      const lost=Math.random()<.48;
+      if(lost){statBox.turnovers++;addStat(result.carrier||result.receiver,'ff',0);addStat(selectDefender(def,'DB'),'fr');events.push(`Q${state.quarter} ${fmt(state.seconds)} FUMBLE recovered by ${defTeam.abbr}`);const newSpot=clamp(rules.fieldLength-state.yardLine,rules.touchbackSpot,rules.fieldLength-rules.touchbackSpot);state.seconds=Math.max(0,state.seconds-randInt(18,30));if(state.overtime)state.otPossessions[offTeam.id]++;resetPossession(defTeam.id,newSpot,false);continue;}
+      events.push(`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr} fumbles but recovers`);
+    }
+    if(state.yardLine<=0){
+      score(defTeam.id,rules.scoring.safety);events.push(`Q${state.quarter} ${fmt(state.seconds)} SAFETY for ${defTeam.abbr}`);state.seconds=Math.max(0,state.seconds-randInt(15,25));if(state.overtime)state.otPossessions[offTeam.id]++;resetPossession(defTeam.id,rules.touchbackSpot,true);continue;
+    }
+    if(state.yardLine>=rules.fieldLength){
+      score(offTeam.id,rules.scoring.td);if(play.startsWith('RUN'))addStat(result.carrier,'rushTD');else{addStat(off.qb,'passTD');addStat(result.receiver,'recTD');}
+      events.push(`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr} TOUCHDOWN — ${result.desc}`);attemptConversion(offTeam,defTeam,off,def,state,rules,home,events);state.seconds=Math.max(0,state.seconds-randInt(8,18));if(state.overtime)state.otPossessions[offTeam.id]++;
+      if(state.overtime){
+        const both=state.otPossessions[home.id]>=rules.overtime.possessionsEach&&state.otPossessions[away.id]>=rules.overtime.possessionsEach;
+        if(both&&state.homeScore!==state.awayScore)break;
+      }
+      resetPossession(defTeam.id,rules.touchbackSpot,true);continue;
+    }
+    if(pen?.automaticFirst || state.toGo<=0){state.down=1;state.toGo=Math.min(rules.firstDownDistance,rules.fieldLength-state.yardLine);statBox.firstDowns++;}
+    else{state.down++;if(state.down>rules.downs){events.push(`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr}: turnover on downs`);state.seconds=Math.max(0,state.seconds-randInt(12,22));const newSpot=clamp(rules.fieldLength-state.yardLine,rules.touchbackSpot,rules.fieldLength-rules.touchbackSpot);if(state.overtime)state.otPossessions[offTeam.id]++;resetPossession(defTeam.id,newSpot,false);continue;}}
+    applyFatigueAndInjuries(offTeam,defTeam,off,def,rules,events,state);
+    state.seconds=Math.max(0,state.seconds-playClockRunoff(state,result,rules));
+    if(state.overtime){
+      const both=state.otPossessions[home.id]>=rules.overtime.possessionsEach&&state.otPossessions[away.id]>=rules.overtime.possessionsEach;
+      if(both&&state.homeScore!==state.awayScore)break;
+    }
+  }
+  if(state.homeScore===state.awayScore && rules.overtime.enabled){
+    let guard=0;while(state.homeScore===state.awayScore&&guard++<3){Math.random()<.5?state.homeScore+=rules.scoring.fg:state.awayScore+=rules.scoring.fg;events.push(`OT sudden-death field goal decides the game`);}
+  }
+  events.push(`--- FINAL: ${away.abbr} ${state.awayScore}, ${home.abbr} ${state.homeScore} ---`);
+  return {homeScore:state.homeScore,awayScore:state.awayScore,events,boxScore:box,engineVersion:'0.3'};
+}
+const fmt=s=>`${Math.floor(s/60)}:${String(Math.max(0,s%60)).padStart(2,'0')}`;
+const KEY='arenaFootballGM_universe_v1';
+let storageAvailable=false;
+function getStorage(){
+  try {
+    const test='__afgm_test__';
+    window.localStorage.setItem(test,'1');
+    window.localStorage.removeItem(test);
+    storageAvailable=true;
+    return window.localStorage;
+  } catch(e) {
+    storageAvailable=false;
+    return null;
+  }
+}
+function saveUniverse(u){
+  const store=getStorage();
+  if(store){ try{ store.setItem(KEY,JSON.stringify(u)); return true; }catch(e){} }
+  return false;
+}
+function loadUniverse(){
+  const store=getStorage();
+  if(!store) return null;
+  try { const raw=store.getItem(KEY); return raw?JSON.parse(raw):null; } catch(e){ return null; }
+}
+function clearSave(){
+  const store=getStorage();
+  if(store){ try{store.removeItem(KEY);}catch(e){} }
+}
+function exportSave(){ return JSON.stringify(universe); }
+function importSave(text){
+  const parsed=JSON.parse(text);
+  if(!parsed || !Array.isArray(parsed.leagues)) throw new Error('Invalid Arena Football GM save.');
+  universe=parsed;
+  persist();
+  render();
+}
+
+
+let universe=loadUniverse();
+if(!universe){ universe=createUniverse(); createLeague(universe,{name:'Arena Football League',teamCount:4}); saveUniverse(universe); }
+let view='league'; let selectedTeamId=null; let selectedGameId=null;
+const app=document.querySelector('#app'), tabs=document.querySelector('#tabs'), saveStatus=document.querySelector('#saveStatus');
+const league=()=>universe.leagues.find(l=>l.id===universe.activeLeagueId)||universe.leagues[0];
+function persist(){
+  const saved=saveUniverse(universe);
+  saveStatus.textContent=saved ? ('Saved '+new Date().toLocaleTimeString()) : 'Session only';
+}
+function h(s){return String(s).split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;');}
+function nav(){
+  tabs.innerHTML=['league','standings','schedule','team','game','universe'].map(x=>`<button data-view="${x}" class="${view===x?'active':''}">${x[0].toUpperCase()+x.slice(1)}</button>`).join('');
+  tabs.querySelectorAll('button').forEach(b=>b.onclick=()=>{view=b.dataset.view;render();});
+}
+function render(){ nav(); const l=league(); if(!l){app.innerHTML='<p>No league.</p>';return;} ({league:renderLeague,standings:renderStandings,schedule:renderSchedule,team:renderTeam,game:renderGame,universe:renderUniverse}[view])(); }
+function renderLeague(){ const l=league(); const next=l.schedule.find(g=>!g.played); app.innerHTML=`
+  <div class="card"><h2>${h(l.name)} — ${l.season}</h2><p class="muted">${l.teams.length} teams · ${l.rules.fieldLength}-yard field · ${l.rules.playersOnField}-man football · Sim Engine v0.3</p>
+  <div class="actions"><button id="simNext" ${!next?'disabled':''}>Sim Next Game</button><button id="simWeek">Sim All Remaining</button><button id="advance" ${next?'disabled':''}>Advance Season</button></div></div>
+  <div class="grid">${l.teams.map(t=>`<div class="card"><h3>${h(t.name)}</h3><div class="score">${t.wins}-${t.losses}</div><p>PF ${t.pf} · PA ${t.pa}</p><button class="openTeam" data-id="${t.id}">Open Team</button></div>`).join('')}</div>`;
+  document.querySelectorAll('.openTeam').forEach(b=>b.onclick=()=>{selectedTeamId=b.dataset.id;view='team';render();});
+  document.querySelector('#simNext').onclick=()=>{simGame(next);};
+  document.querySelector('#simWeek').onclick=()=>{for(const g of l.schedule.filter(g=>!g.played)) simGame(g,false);persist();render();};
+  document.querySelector('#advance').onclick=()=>{try{advanceSeason(l);persist();render();}catch(e){alert(e.message);}};
+}
+function renderStandings(){ const l=league(); app.innerHTML=`<div class="card"><h2>Standings</h2><table><thead><tr><th>Team</th><th>W</th><th>L</th><th>T</th><th>PF</th><th>PA</th></tr></thead><tbody>${standings(l).map(t=>`<tr><td>${h(t.name)}</td><td>${t.wins}</td><td>${t.losses}</td><td>${t.ties}</td><td>${t.pf}</td><td>${t.pa}</td></tr>`).join('')}</tbody></table></div>`; }
+function renderSchedule(){ const l=league(); app.innerHTML=`<div class="card"><h2>${l.season} Schedule</h2><table><tbody>${l.schedule.map(g=>{const H=l.teams.find(t=>t.id===g.homeId),A=l.teams.find(t=>t.id===g.awayId);return `<tr><td>G${g.week}</td><td>${h(A.abbr)} @ ${h(H.abbr)}</td><td>${g.played?`${g.awayScore}-${g.homeScore}`:`<button class="sim" data-id="${g.id}">Sim</button>`}</td><td>${g.played?`<button class="box" data-id="${g.id}">View</button>`:''}</td></tr>`}).join('')}</tbody></table></div>`;
+  document.querySelectorAll('.sim').forEach(b=>b.onclick=()=>simGame(l.schedule.find(g=>g.id===b.dataset.id)));
+  document.querySelectorAll('.box').forEach(b=>b.onclick=()=>{selectedGameId=b.dataset.id;view='game';render();});
+}
+function renderTeam(){ const l=league(); const t=l.teams.find(x=>x.id===selectedTeamId)||l.teams[0]; selectedTeamId=t.id; app.innerHTML=`<div class="card"><h2>${h(t.name)}</h2><p>${t.wins}-${t.losses}-${t.ties} · PF ${t.pf} · PA ${t.pa}</p></div><div class="card"><h3>Roster</h3><table><thead><tr><th>Pos</th><th>Player</th><th>Age</th><th>OVR</th><th>SPD</th><th>SKL</th><th>FAT</th></tr></thead><tbody>${[...t.roster].sort((a,b)=>a.position.localeCompare(b.position)||b.ratings.overall-a.ratings.overall).map(p=>`<tr><td>${p.position}</td><td>${h(p.name)}</td><td>${p.age}</td><td>${p.ratings.overall}</td><td>${p.ratings.speed}</td><td>${p.ratings.skill}</td><td>${p.fatigue}</td></tr>`).join('')}</tbody></table></div>`; }
+function renderGame(){ const l=league(); const g=l.schedule.find(x=>x.id===selectedGameId)||l.schedule.find(x=>x.played); if(!g){app.innerHTML='<div class="card">No completed game yet.</div>';return;} const H=l.teams.find(t=>t.id===g.homeId),A=l.teams.find(t=>t.id===g.awayId),B=g.boxScore||{}; app.innerHTML=`<div class="card"><h2>${h(A.name)} @ ${h(H.name)}</h2><div class="score">${A.abbr} ${g.awayScore} — ${H.abbr} ${g.homeScore}</div><p class="muted">Simulation engine ${g.engineVersion||'legacy'}</p></div><div class="grid"><div class="card"><h3>Team stats</h3><table><tr><th></th><th>${A.abbr}</th><th>${H.abbr}</th></tr><tr><td>First downs</td><td>${B.away?.firstDowns??'-'}</td><td>${B.home?.firstDowns??'-'}</td></tr><tr><td>Total yards</td><td>${B.away?.totalYds??'-'}</td><td>${B.home?.totalYds??'-'}</td></tr><tr><td>Rush yards</td><td>${B.away?.rushYds??'-'}</td><td>${B.home?.rushYds??'-'}</td></tr><tr><td>Pass yards</td><td>${B.away?.passYds??'-'}</td><td>${B.home?.passYds??'-'}</td></tr><tr><td>Turnovers</td><td>${B.away?.turnovers??'-'}</td><td>${B.home?.turnovers??'-'}</td></tr><tr><td>Sacks allowed</td><td>${B.away?.sacksAllowed??'-'}</td><td>${B.home?.sacksAllowed??'-'}</td></tr><tr><td>Penalties</td><td>${B.away?.penalties??'-'}-${B.away?.penaltyYds??'-'}</td><td>${B.home?.penalties??'-'}-${B.home?.penaltyYds??'-'}</td></tr><tr><td>Kick return yards</td><td>${B.away?.kickReturnYds??'-'}</td><td>${B.home?.kickReturnYds??'-'}</td></tr></table></div></div><div class="card"><h3>Play-by-play</h3><div class="log">${(g.events||[]).map(e=>h(e)).join('<br>')}</div></div>`; }
+function renderUniverse(){ app.innerHTML=`<div class="card"><h2>Universe</h2><p>${h(universe.name)}</p><label>Active league <select id="leagueSelect">${universe.leagues.map(l=>`<option value="${l.id}" ${l.id===universe.activeLeagueId?'selected':''}>${h(l.name)} (${l.season})</option>`).join('')}</select></label></div><div class="card"><h3>Save & League Tools</h3><div class="actions"><button id="addLeague">Add League</button><button id="saveNow">Save Now</button><button id="exportSave">Export Save</button><button id="importSave">Import Save</button><button id="reset">Reset Universe</button></div><p class="muted">${storageAvailable?'This browser allows automatic local saves.':'iOS local-file mode blocks automatic browser storage here. The game still works for this session; use Export Save before closing and Import Save when you return.'}</p><textarea id="saveBox" style="width:100%;min-height:120px;margin-top:10px;background:#0d1525;color:#f3f4f6;border:1px solid #3b4a66;border-radius:8px;padding:10px;box-sizing:border-box" placeholder="Exported save data appears here. Paste save data here to import."></textarea></div>`;
+ document.querySelector('#leagueSelect').onchange=e=>{universe.activeLeagueId=e.target.value;persist();render();};
+ document.querySelector('#addLeague').onclick=()=>{createLeague(universe,{name:`Arena League ${universe.leagues.length+1}`,teamCount:4});persist();render();};
+ document.querySelector('#saveNow').onclick=()=>persist();
+ document.querySelector('#exportSave').onclick=()=>{const box=document.querySelector('#saveBox');box.value=exportSave();box.focus();box.select();saveStatus.textContent='Save exported';};
+ document.querySelector('#importSave').onclick=()=>{const box=document.querySelector('#saveBox');try{importSave(box.value);saveStatus.textContent='Save imported';}catch(e){alert(e.message);}};
+ document.querySelector('#reset').onclick=()=>{if(confirm('Delete this universe?')){clearSave();universe=createUniverse();createLeague(universe,{name:'Arena Football League',teamCount:4});persist();render();}};
+}
+function simGame(g,rerender=true){ if(!g||g.played)return; const l=league(),H=l.teams.find(t=>t.id===g.homeId),A=l.teams.find(t=>t.id===g.awayId); const res=simulateGame(H,A,l.rules); recordResult(l,g,res); selectedGameId=g.id; persist(); if(rerender){view='game';render();} }
+saveStatus.textContent=storageAvailable?'Ready · auto-save on':'Ready · session save';
+render();
+</script>
+<script>
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('./service-worker.js').catch(() => {}));
+}
+</script>
+</body>
+</html>
