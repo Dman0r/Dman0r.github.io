@@ -1,0 +1,1637 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="theme-color" content="#111827" />
+<title>Arena Football GM</title>
+<style>
+:root { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color-scheme: dark; }
+body { margin:0; background:#111827; color:#f3f4f6; }
+header { display:flex; justify-content:space-between; align-items:center; padding:14px 18px; background:#0b1220; border-bottom:1px solid #263244; position:sticky; top:0; z-index:2; }
+h1 { font-size:20px; margin:0; }
+nav { display:flex; overflow-x:auto; gap:8px; padding:10px; background:#172033; position:sticky; top:52px; z-index:1; }
+button, select { background:#24324b; color:#fff; border:1px solid #3b4a66; border-radius:8px; padding:9px 11px; }
+button.active { background:#2563eb; }
+button:disabled { opacity:.5; }
+main { padding:14px; max-width:980px; margin:auto; }
+.card { background:#182235; border:1px solid #2a3851; border-radius:12px; padding:14px; margin-bottom:14px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; }
+table { width:100%; border-collapse:collapse; font-size:14px; }
+th, td { text-align:left; padding:8px 6px; border-bottom:1px solid #2b3850; }
+.muted { color:#9ca3af; }
+.good { color:#86efac; }.bad { color:#fca5a5; }
+.score { font-size:34px; font-weight:800; }
+.log { max-height:360px; overflow:auto; background:#0d1525; padding:10px; border-radius:8px; font-family:ui-monospace,monospace; font-size:12px; line-height:1.5; }
+.actions { display:flex; flex-wrap:wrap; gap:8px; }
+.scroll { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+.player-link { background:none; border:0; padding:0; min-height:0; font-size:inherit; color:#93c5fd; text-decoration:underline; }
+.statline { display:flex; gap:14px; flex-wrap:wrap; }
+.statline span { background:#0d1525; border-radius:8px; padding:8px 10px; }
+.small { font-size:12px; }
+
+/* iOS/offline additions */
+html { -webkit-text-size-adjust: 100%; }
+body { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+button, select { min-height: 44px; font-size: 16px; }
+header { padding-top: max(12px, env(safe-area-inset-top)); }
+.log { -webkit-overflow-scrolling: touch; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Arena Football GM</h1>
+  <span id="saveStatus">Starting…</span>
+</header>
+<nav id="tabs"></nav>
+<main id="app"></main>
+<script>
+const nativeRandom = Math.random.bind(Math);
+let ACTIVE_RNG = null;
+function hashSeed(value){
+  let h=2166136261>>>0;
+  for(const ch of String(value)){ h^=ch.charCodeAt(0); h=Math.imul(h,16777619); }
+  return h>>>0 || 1;
+}
+class SeededRNG{
+  constructor(seed=1){ this.state=(Number(seed)>>>0)||1; }
+  next(){
+    let t=this.state+=0x6D2B79F5;
+    t=Math.imul(t^(t>>>15),t|1);
+    t^=t+Math.imul(t^(t>>>7),t|61);
+    return ((t^(t>>>14))>>>0)/4294967296;
+  }
+}
+function random(){ return ACTIVE_RNG ? ACTIVE_RNG.next() : nativeRandom(); }
+const uid = (prefix="id") => `${prefix}_${Date.now().toString(36)}_${nativeRandom().toString(36).slice(2,8)}`;
+const clamp = (n,min,max) => Math.max(min,Math.min(max,n));
+const randInt = (min,max) => Math.floor(random()*(max-min+1))+min;
+const choice = arr => arr[Math.floor(random()*arr.length)];
+const weighted = entries => {
+  const total = entries.reduce((s,[,w])=>s+w,0); let r=random()*total;
+  for (const [v,w] of entries) { r-=w; if (r<=0) return v; }
+  return entries.at(-1)[0];
+};
+const deepClone = obj => JSON.parse(JSON.stringify(obj));
+const DEFAULT_RULES = {
+  name:"Arena Football GM Base",
+  fieldLength:50, fieldWidth:28, endZoneLength:8, downs:4, firstDownDistance:10, quarterMinutes:15, playersOnField:8,
+  wallsInPlay:true, reboundNets:true, highMotion:true, secondMotionMan:false, ironman:true, punting:false,
+  dropKicks:true, fourPointDropFieldGoal:true, deuce:true, uno:false, rouge:true, halo:true, jackRestrictions:"classic", runningClock:true,
+  kickoffSpot:0, touchbackSpot:5, kickoffOutOfBoundsSpot:20,
+  field:{length:50,width:28,endZoneDepth:8,walls:"live"},
+  personnel:{playersPerSide:8,ironman:true,substitutionMode:"ironman",specialistExemptions:["QB","K"],motionPlayers:1,highMotion:true,offenseSlots:{QB:1,FB:1,WR:3,OL:3},defenseSlots:{DL:3,LB:1,DB:4}},
+  defense:{jackRestriction:"classic",allowFreeBlitz:false,maxBlitzers:1,jackBoxDepth:5,jackMayBlitz:false,alignmentErrorRate:.006},
+  kicking:{punting:false,reboundNets:true,dropKicks:true,puntMinDistance:18,kickoffOutOfBoundsSpot:20,deuce:{enabled:true,points:2},uno:{enabled:false,points:1},rouge:{enabled:true,points:1,trigger:"kick_dead_end_zone",possession:"receiving",spot:5},halo:true,haloViolationRate:.006},
+  motion:{offensivePlayers:1,forwardMotionAllowed:true,secondMotionMan:false,eligiblePositions:["WR"],illegalExecutionRate:.006},
+  clock:{stopOnIncomplete:true,stopOnOutOfBounds:true,stopOnChangeOfPossession:true,firstHalfFinalMinute:60,secondHalfFinalMinute:60,runningClock:true,timeoutsPerHalf:3,timeoutClockRunoff:[4,8],normalRunoff:[22,38],hurryRunoff:[10,20],bleedRunoff:[30,42],spikeRunoff:[2,4],kneelRunoff:[30,40],quarterBreakRecovery:7,halftimeRecovery:18},
+  overtime:{enabled:true,possessionsEach:1,suddenDeathAfter:true,maxPeriods:3},
+  penalties:{enabled:true,offensiveRate:.045,defensiveRate:.04,illegalMotionRate:.008,illegalDefenseRate:.008},
+  injuries:{enabled:true,perSnapRate:.0015,fatigueThreshold:55,maxRate:.008,recoveryBetweenPlays:0.35,recoveryQuarter:6,recoveryHalftime:16},
+  scoring:{td:6,xp1:1,xp2:2,fg:3,safety:2,dropFg:4,dropPat:2}
+};
+
+const TEAM_TEMPLATES = [
+  ["Philadelphia Soul", "PHI"], ["Albany Firebirds", "ALB"],
+  ["Orlando Predators", "ORL"], ["Arizona Rattlers", "ARI"],
+  ["Chicago Rush", "CHI"], ["San Jose SaberCats", "SJS"],
+  ["Tampa Bay Storm", "TBS"], ["Iowa Barnstormers", "IOW"]
+];
+
+const POSITIONS = ["QB","FB","WR","OL","DL","LB","DB","K"];
+function slotCountsFor(playersPerSide=8){
+  const n=clamp(Math.round(playersPerSide||8),4,12);
+  const ol=n>=7?3:2,fb=n>=6?1:0,wr=Math.max(1,n-1-ol-fb);
+  const dl=n>=7?3:2,lb=1,db=Math.max(1,n-dl-lb);
+  return {offense:{QB:1,FB:fb,WR:wr,OL:ol},defense:{DL:dl,LB:lb,DB:db}};
+}
+function rosterTemplateForRules(inputRules){
+  const r=normalizeRules(inputRules),o=r.personnel.offenseSlots,d=r.personnel.defenseSlots,positions=[];
+  const add=(pos,n)=>{for(let i=0;i<n;i++)positions.push(pos);};
+  add('QB',Math.max(1,o.QB||1));add('FB',Math.max(1,o.FB||0));add('WR',Math.max(2,(o.WR||1)+1));add('OL',Math.max(2,o.OL||2));
+  add('DL',Math.max(2,d.DL||2));add('LB',Math.max(1,d.LB||1));add('DB',Math.max(2,(d.DB||2)+1));add('K',1);
+  return positions;
+}
+
+const first=["Aaron","Aiden","Andre","Anthony","Brandon","Bryce","Caleb","Cam","Cameron","Carlos","Chris","Dante","Darius","Darren","DeAndre","Devin","Derek","Elijah","Eric","Isaiah","Jalen","Jamal","Jay","Jaylen","Jordan","Justin","Kendrick","Kevin","Malik","Marcus","Mason","Micah","Nate","Noah","Quentin","Rashad","Ryan","Sean","Tariq","Terrance","Tre","Trey","Ty","Victor","Xavier","Zay"];
+const last=["Adams","Allen","Anderson","Baker","Bell","Brooks","Brown","Carter","Clark","Collins","Cooper","Davis","Edwards","Evans","Foster","Garcia","Gibson","Green","Hall","Harris","Hill","Jackson","James","Jenkins","Johnson","Jones","Kelly","King","Lewis","Martin","Miller","Mitchell","Moore","Murphy","Nelson","Parker","Reed","Robinson","Rodriguez","Scott","Smith","Stewart","Taylor","Thomas","Thompson","Turner","Walker","Ward","Washington","White","Williams","Wilson","Wright","Young"];
+const hometowns=["Atlanta, GA","Baltimore, MD","Birmingham, AL","Charlotte, NC","Chicago, IL","Columbus, OH","Dallas, TX","Detroit, MI","Houston, TX","Jacksonville, FL","Las Vegas, NV","Los Angeles, CA","Memphis, TN","Miami, FL","Nashville, TN","New Orleans, LA","Orlando, FL","Philadelphia, PA","Phoenix, AZ","Pittsburgh, PA","San Antonio, TX","San Diego, CA","St. Louis, MO","Tampa, FL"];
+function positionBody(position){
+  const map={QB:[72,77,195,235],FB:[69,74,210,255],WR:[68,75,175,225],OL:[72,79,285,355],DL:[71,78,250,325],LB:[70,76,220,280],DB:[68,74,175,220],K:[68,75,165,215]};
+  return map[position]||[69,76,180,250];
+}
+function fillPlayerBio(p){
+  const seed=hashSeed(p.id||p.name||'player'),body=positionBody(p.position),span=(a,b,n)=>a+(n%(b-a+1));
+  p.heightInches??=span(body[0],body[1],seed);
+  p.weight??=span(body[2],body[3],seed>>>5);
+  p.hometown??=hometowns[(seed>>>10)%hometowns.length];
+  p.jerseyNumber??=((seed>>>16)%99)+1;
+  return p;
+}
+function formatHeight(n){n=Number(n)||72;return `${Math.floor(n/12)}'${n%12}"`;}
+
+const POSITION_RATING_WEIGHTS={
+  QB:{passShort:1.6,passMedium:1.5,passDeep:1.1,armStrength:1.15,decision:1.45,awareness:1.15,scramble:.55},
+  FB:{vision:1.1,power:1.15,breakTackle:1.1,ballSecurity:1.15,runBlock:.65,speed:.55,strength:.7},
+  WR:{catching:1.35,routeRunning:1.3,release:1.05,speed:1.05,acceleration:.8,contestedCatch:.7,motion:.55},
+  OL:{passBlock:1.4,runBlock:1.4,blockStrength:1.1,strength:1,awareness:.7,stamina:.55},
+  DL:{passRush:1.3,blockShedding:1.25,strength:1,pursuit:.75,tackling:.7,awareness:.55},
+  LB:{tackling:1.25,pursuit:1.1,zoneCoverage:.9,blockShedding:.8,strength:.7,awareness:.8,twoWay:.45},
+  DB:{manCoverage:1.25,zoneCoverage:1.2,speed:1,acceleration:.8,awareness:.85,tackling:.65,wallAwareness:.5},
+  K:{kickAccuracy:1.55,kickPower:1.25,kickoff:1,dropKick:.85,awareness:.35}
+};
+function calculateOverall(player){
+  const weights=POSITION_RATING_WEIGHTS[player.position]||{awareness:1,speed:1,strength:1},r=player.ratings||{};
+  let total=0,w=0;for(const [k,wt] of Object.entries(weights)){total+=(r[k]??r.overall??50)*wt;w+=wt;}
+  return clamp(Math.round(total/Math.max(.01,w)),25,99);
+}
+function recalculateOverall(player){player.ratings.overall=calculateOverall(player);player.ratings.skill=Math.round(((player.ratings.awareness||50)+(player.ratings.speed||50)+(player.ratings.strength||50))/3);return player.ratings.overall;}
+const PLAYER_ARCHETYPES={
+  QB:['Pocket Passer','Mobile QB','Gunslinger'],FB:['Power Back','Two-Way Fullback','Space Back'],WR:['Speed Receiver','Possession Receiver','Motion Specialist'],OL:['Pass Protector','Road Grader','Two-Way Lineman'],DL:['Edge Rusher','Power Rusher','Run Anchor'],LB:['Coverage Jack','Mac Enforcer','Two-Way Backer'],DB:['Man Cover DB','Zone DB','Physical DB'],K:['Accuracy Kicker','Power Kicker','Drop-Kick Specialist']
+};
+function applyArchetype(position,ratings,archetype){
+  const boost=(keys,n)=>keys.forEach(k=>ratings[k]=clamp((ratings[k]||50)+n,25,99));
+  if(archetype==='Pocket Passer')boost(['passShort','passMedium','decision','awareness'],7);
+  if(archetype==='Mobile QB')boost(['scramble','speed','acceleration','agility'],8);
+  if(archetype==='Gunslinger')boost(['armStrength','passDeep'],9);
+  if(archetype==='Power Back')boost(['power','breakTackle','strength','ballSecurity'],8);
+  if(archetype==='Two-Way Fullback')boost(['twoWay','tackling','runBlock','strength'],8);
+  if(archetype==='Space Back')boost(['speed','acceleration','agility','elusiveness'],8);
+  if(archetype==='Speed Receiver')boost(['speed','acceleration','release'],9);
+  if(archetype==='Possession Receiver')boost(['catching','routeRunning','contestedCatch'],8);
+  if(archetype==='Motion Specialist')boost(['motion','release','acceleration','routeRunning'],8);
+  if(archetype==='Pass Protector')boost(['passBlock','awareness'],10);
+  if(archetype==='Road Grader')boost(['runBlock','blockStrength','strength'],9);
+  if(archetype==='Two-Way Lineman')boost(['twoWay','passRush','blockShedding','runBlock'],7);
+  if(archetype==='Edge Rusher')boost(['passRush','speed','pursuit'],9);
+  if(archetype==='Power Rusher')boost(['passRush','strength','blockShedding'],8);
+  if(archetype==='Run Anchor')boost(['tackling','blockShedding','strength'],8);
+  if(archetype==='Coverage Jack')boost(['zoneCoverage','manCoverage','awareness','twoWay'],8);
+  if(archetype==='Mac Enforcer')boost(['tackling','pursuit','strength','blockShedding'],8);
+  if(archetype==='Two-Way Backer')boost(['twoWay','tackling','zoneCoverage','runBlock'],7);
+  if(archetype==='Man Cover DB')boost(['manCoverage','speed','release'],8);
+  if(archetype==='Zone DB')boost(['zoneCoverage','awareness','pursuit'],8);
+  if(archetype==='Physical DB')boost(['tackling','strength','contestedCatch'],8);
+  if(archetype==='Accuracy Kicker')boost(['kickAccuracy','dropKick'],10);
+  if(archetype==='Power Kicker')boost(['kickPower','kickoff'],10);
+  if(archetype==='Drop-Kick Specialist')boost(['dropKick','kickAccuracy'],12);
+}
+function playerDevelopmentKeys(position){
+  return Object.keys(POSITION_RATING_WEIGHTS[position]||{}).filter(k=>k!=='overall');
+}
+function createPlayer(position,teamId){
+  const age=randInt(21,33),base=randInt(42,78),r=(d=0)=>clamp(base+d+randInt(-9,9),25,99);
+  const ratings={overall:base,speed:r(),acceleration:r(),agility:r(),strength:r(),stamina:r(4),durability:r(5),awareness:r(),
+    passShort:r(),passMedium:r(),passDeep:r(),armStrength:r(),decision:r(),scramble:r(),catching:r(),routeRunning:r(),release:r(),contestedCatch:r(),ballSecurity:r(),
+    vision:r(),elusiveness:r(),power:r(),breakTackle:r(),passBlock:r(),runBlock:r(),blockStrength:r(),manCoverage:r(),zoneCoverage:r(),tackling:r(),passRush:r(),blockShedding:r(),pursuit:r(),
+    kickPower:r(),kickAccuracy:r(),kickoff:r(),dropKick:r(),twoWay:r(),wallAwareness:r(),motion:r()};
+  if(position==='QB'){Object.assign(ratings,{passShort:r(12),passMedium:r(9),passDeep:r(6),armStrength:r(10),decision:r(10),scramble:r(3)});}
+  if(position==='WR'){Object.assign(ratings,{catching:r(10),routeRunning:r(10),release:r(8),motion:r(8),speed:r(7)});}
+  if(position==='FB'){Object.assign(ratings,{vision:r(8),power:r(10),breakTackle:r(8),ballSecurity:r(8)});}
+  if(position==='OL'){Object.assign(ratings,{passBlock:r(12),runBlock:r(12),blockStrength:r(12),strength:r(10)});}
+  if(position==='DL'){Object.assign(ratings,{passRush:r(12),blockShedding:r(11),strength:r(8)});}
+  if(position==='LB'){Object.assign(ratings,{tackling:r(10),pursuit:r(8),zoneCoverage:r(5)});}
+  if(position==='DB'){Object.assign(ratings,{manCoverage:r(11),zoneCoverage:r(10),tackling:r(5),speed:r(7)});}
+  if(position==='K'){Object.assign(ratings,{kickPower:r(14),kickAccuracy:r(14),kickoff:r(12),dropKick:r(8)});}
+  const archetype=choice(PLAYER_ARCHETYPES[position]||['Balanced']);applyArchetype(position,ratings,archetype);
+  const player=fillPlayerBio({id:uid('p'),teamId,name:`${choice(first)} ${choice(last)}`,position,secondaryPositions:[],age,experience:Math.max(0,age-21),potential:clamp(base+randInt(6,24)-(age-21),35,95),archetype,ratings,fatigue:0,injuredGames:0,rosterStatus:'active',careerStatus:'active',stats:emptyStats(),seasonStats:emptyStats(),history:[],awards:[]});
+  recalculateOverall(player);return player;
+}
+function emptyStats(){return {gp:0,offSnaps:0,defSnaps:0,stSnaps:0,passAtt:0,passCmp:0,passYds:0,passTD:0,int:0,rushAtt:0,rushYds:0,rushTD:0,rec:0,recYds:0,recTD:0,tackles:0,sacks:0,defInt:0,defTD:0,intRet:0,intRetYds:0,ff:0,fr:0,fumRet:0,fumRetYds:0,kr:0,krYds:0,krTD:0,pr:0,prYds:0,prTD:0,fgm:0,fga:0,xpm:0,xpa:0};}
+function generateRoster(teamId,rules=DEFAULT_RULES){return rosterTemplateForRules(rules).map(pos=>createPlayer(pos,teamId));}
+function developPlayer(p){
+  p.age=(p.age||21)+1;p.experience=(p.experience||0)+1;
+  const pot=p.potential??p.ratings?.overall??55,ovr=p.ratings?.overall??55;
+  const age=p.age,upside=clamp((pot-ovr)/18,-1.5,2.5);
+  let ageTrend=age<=23?1.7:age<=26?1.05:age<=29?.25:age<=32?-.75:-1.7;
+  const keys=new Set([...playerDevelopmentKeys(p.position),'speed','acceleration','agility','strength','stamina','durability','awareness','twoWay','wallAwareness','motion']);
+  for(const key of keys){
+    if(key==='overall'||key==='skill'||p.ratings[key]===undefined)continue;
+    const physical=['speed','acceleration','agility','stamina'].includes(key),veteranPenalty=physical&&age>=30?-0.8:0;
+    const change=Math.round(ageTrend+upside+veteranPenalty+(random()*3.4-1.7));
+    p.ratings[key]=clamp(p.ratings[key]+change,25,99);
+  }
+  p.potential=clamp(Math.round(pot+(age<=24?randInt(-1,2):randInt(-2,0))),30,99);
+  p.fatigue=0;p.injuredGames=Math.max(0,(p.injuredGames||0)-1);recalculateOverall(p);return p;
+}
+function developRoster(players){for(const p of players)developPlayer(p);}
+function retirementProbability(p){
+  const age=p.age||25,ovr=p.ratings?.overall||50,inj=(p.injuredGames||0)>0?0.02:0;
+  if(age<29)return .002+inj;if(age<32)return .015+Math.max(0,52-ovr)/800+inj;if(age<35)return .08+Math.max(0,60-ovr)/350+inj;if(age<38)return .28+Math.max(0,65-ovr)/220+inj;return .68+inj;
+}
+function shouldRetire(p){return random()<clamp(retirementProbability(p),0,.94);}
+function transaction(league,type,player,{fromTeamId=null,toTeamId=null,details=''}={}){
+  league.transactions??=[];const tx={id:uid('tx'),season:league.season,phase:league.phase,type,playerId:player.id,playerName:player.name,fromTeamId,toTeamId,details};league.transactions.push(tx);return tx;
+}
+function addFreeAgent(league,p,details='Entered free agency'){
+  league.freeAgents??=[];p.teamId=null;p.rosterStatus='freeAgent';p.careerStatus='active';if(!league.freeAgents.some(x=>x.id===p.id))league.freeAgents.push(p);transaction(league,'free_agent',p,{details});return p;
+}
+function retirePlayer(league,p,fromTeamId=null){
+  league.retiredPlayers??=[];p.teamId=null;p.rosterStatus='retired';p.careerStatus='retired';p.retiredSeason=league.season;league.retiredPlayers.push(p);transaction(league,'retirement',p,{fromTeamId,details:`Retired at age ${p.age}`});
+}
+function signPlayer(league,team,p,details='CPU signing'){
+  league.freeAgents??=[];league.freeAgents=league.freeAgents.filter(x=>x.id!==p.id);p.teamId=team.id;p.rosterStatus='active';p.careerStatus='active';team.roster.push(p);transaction(league,'signing',p,{toTeamId:team.id,details});team.depthChart=null;return p;
+}
+function releasePlayer(league,team,p,details='Released'){
+  team.roster=team.roster.filter(x=>x.id!==p.id);team.depthChart=null;p.teamId=null;p.rosterStatus='freeAgent';league.freeAgents??=[];league.freeAgents.push(p);transaction(league,'release',p,{fromTeamId:team.id,details});return p;
+}
+function rosterNeeds(team,rules){
+  const required=rosterTemplateForRules(rules),counts={};for(const p of team.roster)counts[p.position]=(counts[p.position]||0)+1;
+  const want={};for(const pos of required)want[pos]=(want[pos]||0)+1;return Object.entries(want).flatMap(([pos,n])=>Array(Math.max(0,n-(counts[pos]||0))).fill(pos));
+}
+function bestFreeAgentFor(league,pos){return [...(league.freeAgents||[])].filter(p=>p.position===pos&&p.careerStatus!=='retired').sort((a,b)=>(b.ratings?.overall||0)-(a.ratings?.overall||0))[0]||null;}
+function repairTeamRoster(league,team){
+  for(const pos of rosterNeeds(team,league.rules)){
+    let p=bestFreeAgentFor(league,pos);if(!p){p=createPlayer(pos,null);p.age=randInt(21,27);p.experience=Math.max(0,p.age-21);p.rosterStatus='freeAgent';p.teamId=null;league.freeAgents??=[];league.freeAgents.push(p);}
+    signPlayer(league,team,p,'Roster repair signing');
+  }
+  ensureDepthChart(team,league.rules);return validateLineup(team,starters(team,league.rules),league.rules);
+}
+function seedFreeAgents(league,count=Math.max(10,league.teams.length*3)){
+  league.freeAgents??=[];const template=rosterTemplateForRules(league.rules);
+  while(league.freeAgents.length<count){const p=createPlayer(choice(template),null);p.teamId=null;p.rosterStatus='freeAgent';league.freeAgents.push(p);}return league.freeAgents;
+}
+function cpuRosterImprove(league,team,maxMoves=2){
+  let moves=0;const positions=[...new Set(team.roster.map(p=>p.position))];
+  while(moves<maxMoves){
+    let bestMove=null;
+    for(const pos of positions){
+      const current=team.roster.filter(p=>p.position===pos).sort((a,b)=>(a.ratings?.overall||0)-(b.ratings?.overall||0))[0],fa=bestFreeAgentFor(league,pos);
+      if(!current||!fa)continue;const gain=(fa.ratings?.overall||0)-(current.ratings?.overall||0);
+      if(gain>=5&&(!bestMove||gain>bestMove.gain))bestMove={current,fa,gain};
+    }
+    if(!bestMove)break;releasePlayer(league,team,bestMove.current,`CPU roster upgrade (${bestMove.gain} OVR gain)`);signPlayer(league,team,bestMove.fa,'CPU roster upgrade signing');moves++;
+  }
+  return moves;
+}
+function processOffseasonPlayerWorld(league){
+  league.freeAgents??=[];league.retiredPlayers??=[];league.transactions??=[];
+  for(const team of league.teams){
+    const staying=[];
+    for(const p of team.roster){developPlayer(p);if(shouldRetire(p))retirePlayer(league,p,team.id);else staying.push(p);}team.roster=staying;team.depthChart=null;
+  }
+  for(const p of [...league.freeAgents]){developPlayer(p);if(shouldRetire(p)){league.freeAgents=league.freeAgents.filter(x=>x.id!==p.id);retirePlayer(league,p,null);}}
+  seedFreeAgents(league,Math.max(12,league.teams.length*4));
+  for(const team of league.teams){repairTeamRoster(league,team);cpuRosterImprove(league,team,2);repairTeamRoster(league,team);}
+}
+
+function depthChart(roster){
+  const byPos={};
+  for(const p of roster){ (byPos[p.position]??=[]).push(p); }
+  for(const list of Object.values(byPos)) list.sort((a,b)=>b.ratings.overall-a.ratings.overall);
+  return byPos;
+}
+
+function createUniverse(name='Arena Universe'){
+  return { id:uid('u'), name, createdAt:new Date().toISOString(), activeLeagueId:null, leagues:[], history:[], version:SAVE_SCHEMA_VERSION };
+}
+function createLeague(universe,{name='Arena League',teamCount=4,rules=DEFAULT_RULES,scheduleConfig=null,playoffConfig=null}={}){
+  const league={
+    id:uid('lg'),name,season:2026,phase:'regularSeason',rules:deepClone(rules),teams:[],schedule:[],completedSeasons:[],
+    scheduleConfig:{format:'round_robin',rounds:2,...(scheduleConfig||{})},
+    playoffConfig:{enabled:true,teams:4,reseed:true,...(playoffConfig||{})},
+    playoffState:null,
+    records:{game:{},season:{}},
+    history:[],freeAgents:[],retiredPlayers:[],transactions:[],pendingRules:null
+  };
+  for(let i=0;i<teamCount;i++){
+    const [teamName,abbr]=TEAM_TEMPLATES[i%TEAM_TEMPLATES.length],id=uid('t');
+    league.teams.push({id,franchiseId:id,name:teamName,abbr,roster:generateRoster(id,rules),wins:0,losses:0,ties:0,pf:0,pa:0,gamesPlayed:0,history:[]});
+  }
+  seedFreeAgents(league,Math.max(12,teamCount*4));
+  for(const t of league.teams)ensureDepthChart(t,league.rules);
+  league.schedule=generateSchedule(league.teams,league.season,league.scheduleConfig);
+  universe.leagues.push(league);universe.activeLeagueId??=league.id;
+  return league;
+}
+function newScheduledGame(season,week,home,away,extra={}){
+  const gameId=uid('g');
+  return {id:gameId,seed:hashSeed(`${season}:${gameId}:${home.id}:${away.id}`),season,week,homeId:home.id,awayId:away.id,stage:'regular',played:false,homeScore:null,awayScore:null,boxScore:null,gameStats:null,events:null,eventLog:null,drives:null,engineVersion:null,...extra};
+}
+function generateSchedule(teams,season,config={}){
+  const rounds=Math.max(1,config.rounds??2),list=teams.slice();
+  if(list.length%2===1)list.push(null);
+  const n=list.length,games=[],base=list.slice();
+  for(let cycle=0;cycle<rounds;cycle++){
+    let rot=base.slice();
+    for(let round=0;round<n-1;round++){
+      const week=cycle*(n-1)+round+1;
+      for(let i=0;i<n/2;i++){
+        const a=rot[i],b=rot[n-1-i];if(!a||!b)continue;
+        let home,away;
+        const flip=((round+i+cycle)%2===0);
+        if(cycle%2===1){home=flip?a:b;away=flip?b:a;}else{home=flip?b:a;away=flip?a:b;}
+        games.push(newScheduledGame(season,week,home,away,{stage:'regular'}));
+      }
+      rot=[rot[0],rot[n-1],...rot.slice(1,n-1)];
+    }
+  }
+  return games;
+}
+function validateSchedule(teams,games){
+  const ids=new Set(teams.map(t=>t.id)),issues=[],weekUse=new Map();
+  for(const g of games||[]){
+    if(!ids.has(g.homeId)||!ids.has(g.awayId))issues.push(`game ${g.id} references unknown team`);
+    if(g.homeId===g.awayId)issues.push(`game ${g.id} is a self-game`);
+    const keyH=`${g.week}:${g.homeId}`,keyA=`${g.week}:${g.awayId}`;
+    if(weekUse.has(keyH))issues.push(`${g.homeId} scheduled twice in week ${g.week}`);if(weekUse.has(keyA))issues.push(`${g.awayId} scheduled twice in week ${g.week}`);
+    weekUse.set(keyH,true);weekUse.set(keyA,true);
+  }
+  return issues;
+}
+function regularGames(league){return (league.schedule||[]).filter(g=>(g.stage||'regular')==='regular');}
+function recalculateTeamRecords(league){
+  const map=new Map(league.teams.map(t=>[t.id,{wins:0,losses:0,ties:0,pf:0,pa:0,gamesPlayed:0,homeWins:0,homeLosses:0,awayWins:0,awayLosses:0,streak:'—'}]));
+  for(const g of regularGames(league).filter(g=>g.played)){
+    const h=map.get(g.homeId),a=map.get(g.awayId);if(!h||!a)continue;
+    h.gamesPlayed++;a.gamesPlayed++;h.pf+=g.homeScore;h.pa+=g.awayScore;a.pf+=g.awayScore;a.pa+=g.homeScore;
+    if(g.homeScore>g.awayScore){h.wins++;a.losses++;h.homeWins++;a.awayLosses++;}
+    else if(g.awayScore>g.homeScore){a.wins++;h.losses++;a.awayWins++;h.homeLosses++;}
+    else{h.ties++;a.ties++;}
+  }
+  for(const t of league.teams){
+    const recent=regularGames(league).filter(g=>g.played&&(g.homeId===t.id||g.awayId===t.id)).sort((a,b)=>(b.week||0)-(a.week||0));let mark=null,count=0;
+    for(const g of recent){const ts=t.id===g.homeId?g.homeScore:g.awayScore,os=t.id===g.homeId?g.awayScore:g.homeScore,cur=ts>os?'W':ts<os?'L':'T';if(mark==null){mark=cur;count=1;}else if(cur===mark)count++;else break;}map.get(t.id).streak=mark?`${mark}${count}`:'—';Object.assign(t,map.get(t.id));
+  }
+}
+function headToHeadPct(league,teamId,otherId){
+  let w=0,l=0,t=0;
+  for(const g of regularGames(league).filter(g=>g.played&&[g.homeId,g.awayId].includes(teamId)&&[g.homeId,g.awayId].includes(otherId))){
+    const ts=teamId===g.homeId?g.homeScore:g.awayScore,os=teamId===g.homeId?g.awayScore:g.homeScore;
+    if(ts>os)w++;else if(ts<os)l++;else t++;
+  }
+  const gp=w+l+t;return gp?(w+.5*t)/gp:.5;
+}
+function standings(league){
+  recalculateTeamRecords(league);
+  const list=[...league.teams];
+  return list.sort((a,b)=>{
+    const ap=(a.wins+.5*a.ties)/Math.max(1,a.gamesPlayed),bp=(b.wins+.5*b.ties)/Math.max(1,b.gamesPlayed);
+    if(bp!==ap)return bp-ap;
+    const ah=headToHeadPct(league,a.id,b.id),bh=headToHeadPct(league,b.id,a.id);if(bh!==ah)return bh-ah;
+    const ad=a.pf-a.pa,bd=b.pf-b.pa;if(bd!==ad)return bd-ad;
+    if(b.pf!==a.pf)return b.pf-a.pf;
+    return a.name.localeCompare(b.name);
+  });
+}
+function ensureLeagueRecords(league){league.records??={game:{},season:{},career:{}};league.records.game??={};league.records.season??={};league.records.career??={};return league.records;}
+function setRecord(container,key,value,meta){
+  const cur=container[key];if(cur==null||value>cur.value)container[key]={value,...meta};
+}
+function updateLeagueGameRecords(league,game,result){
+  const rec=ensureLeagueRecords(league).game,season=game.season;
+  setRecord(rec,'teamPoints',result.homeScore,{season,teamId:game.homeId,gameId:game.id});setRecord(rec,'teamPoints',result.awayScore,{season,teamId:game.awayId,gameId:game.id});
+  for(const [playerId,st] of Object.entries(result.gameStats?.players||{})){
+    setRecord(rec,'passingYards',st.passYds||0,{season,playerId,gameId:game.id});
+    setRecord(rec,'passingTD',st.passTD||0,{season,playerId,gameId:game.id});
+    setRecord(rec,'rushingYards',st.rushYds||0,{season,playerId,gameId:game.id});
+    setRecord(rec,'rushingTD',st.rushTD||0,{season,playerId,gameId:game.id});
+    setRecord(rec,'receivingYards',st.recYds||0,{season,playerId,gameId:game.id});
+    setRecord(rec,'receivingTD',st.recTD||0,{season,playerId,gameId:game.id});
+    setRecord(rec,'tackles',st.tackles||0,{season,playerId,gameId:game.id});
+    setRecord(rec,'sacks',st.sacks||0,{season,playerId,gameId:game.id});
+    setRecord(rec,'defInterceptions',st.defInt||0,{season,playerId,gameId:game.id});
+    setRecord(rec,'fieldGoals',st.fgm||0,{season,playerId,gameId:game.id});
+    setRecord(rec,'returnYards',(st.krYds||0)+(st.prYds||0)+(st.intRetYds||0)+(st.fumRetYds||0),{season,playerId,gameId:game.id});
+  }
+}
+function recordResult(league,game,result){
+  if(game.played)return;
+  game.played=true;game.homeScore=result.homeScore;game.awayScore=result.awayScore;game.boxScore=result.boxScore;
+  game.events=result.events;game.eventLog=result.eventLog||null;game.drives=result.drives||null;game.gameStats=result.gameStats||null;game.engineVersion=result.engineVersion||null;game.seed=result.seed??game.seed;
+  if((game.stage||'regular')==='regular')recalculateTeamRecords(league);
+  updateLeagueGameRecords(league,game,result);
+  if((game.stage||'regular')==='playoff')ensurePlayoffProgress(league);
+}
+function playoffTeamCount(league){
+  const wanted=Math.min(league.playoffConfig?.teams||4,league.teams.length);let p=1;while(p*2<=wanted)p*=2;return p>=2?p:0;
+}
+function playoffRoundLabel(teamCount,round){
+  const remaining=teamCount/Math.pow(2,round-1);
+  if(remaining===2)return'Championship';if(remaining===4)return'Semifinal';if(remaining===8)return'Quarterfinal';return`Playoff Round ${round}`;
+}
+function createPlayoffRound(league,entries,round){
+  const sorted=entries.slice().sort((a,b)=>a.seed-b.seed),week=(regularGames(league).reduce((m,g)=>Math.max(m,g.week||0),0)+round),label=playoffRoundLabel(league.playoffState.teamCount,round),games=[];
+  while(sorted.length>=2){
+    const high=sorted.shift(),low=sorted.pop(),home=league.teams.find(t=>t.id===high.teamId),away=league.teams.find(t=>t.id===low.teamId);
+    games.push(newScheduledGame(league.season,week,home,away,{stage:'playoff',playoffRound:round,playoffLabel:label,homeSeed:high.seed,awaySeed:low.seed}));
+  }
+  league.schedule.push(...games);league.playoffState.round=round;league.phase=games.length===1?'championship':'playoffs';
+  return games;
+}
+function initializePlayoffs(league){
+  if(league.playoffState)return;
+  const n=playoffTeamCount(league);
+  if(!league.playoffConfig?.enabled||n<2){league.playoffState={championTeamId:standings(league)[0]?.id||null,teamCount:0,round:0,seeds:[]};league.phase='offseason';return;}
+  const seeds=standings(league).slice(0,n).map((t,i)=>({teamId:t.id,seed:i+1}));
+  league.playoffState={teamCount:n,round:0,seeds,championTeamId:null};
+  createPlayoffRound(league,seeds,1);
+}
+function ensurePlayoffProgress(league){
+  const ps=league.playoffState;if(!ps||ps.championTeamId)return;
+  const roundGames=(league.schedule||[]).filter(g=>g.stage==='playoff'&&g.playoffRound===ps.round);
+  if(!roundGames.length||roundGames.some(g=>!g.played))return;
+  const seedMap=new Map(ps.seeds.map(x=>[x.teamId,x.seed])),winners=roundGames.map(g=>g.homeScore>=g.awayScore?g.homeId:g.awayId).map(teamId=>({teamId,seed:seedMap.get(teamId)??99})).sort((a,b)=>a.seed-b.seed);
+  if(winners.length===1){ps.championTeamId=winners[0].teamId;league.phase='offseason';return;}
+  createPlayoffRound(league,winners,ps.round+1);
+}
+function updateLeagueSeasonRecords(league){
+  const rec=ensureLeagueRecords(league).season;
+  for(const t of league.teams){
+    setRecord(rec,'teamWins',t.wins,{season:league.season,teamId:t.id});
+    setRecord(rec,'teamPoints',t.pf||0,{season:league.season,teamId:t.id});
+  }
+  for(const t of league.teams)for(const p of t.roster){
+    const st=p.seasonStats||emptyStats(),meta={season:league.season,playerId:p.id,teamId:t.id,name:p.name,position:p.position};
+    setRecord(rec,'passingYards',st.passYds||0,meta);setRecord(rec,'passingTD',st.passTD||0,meta);
+    setRecord(rec,'rushingYards',st.rushYds||0,meta);setRecord(rec,'rushingTD',st.rushTD||0,meta);
+    setRecord(rec,'receivingYards',st.recYds||0,meta);setRecord(rec,'receivingTD',st.recTD||0,meta);
+    setRecord(rec,'tackles',st.tackles||0,meta);setRecord(rec,'sacks',st.sacks||0,meta);setRecord(rec,'defInterceptions',st.defInt||0,meta);
+    setRecord(rec,'fieldGoals',st.fgm||0,meta);setRecord(rec,'kickReturnYards',st.krYds||0,meta);
+  }
+}
+function offensiveAwardScore(p){
+  const s=p.seasonStats||emptyStats();
+  if(p.position==='QB')return (s.passYds||0)*.028+(s.passTD||0)*7-(s.int||0)*4+(s.rushYds||0)*.04+(s.rushTD||0)*6;
+  return (s.recYds||0)*.055+(s.recTD||0)*7+(s.rushYds||0)*.06+(s.rushTD||0)*7+(s.rec||0)*.35;
+}
+function defensiveAwardScore(p){const s=p.seasonStats||emptyStats();return (s.tackles||0)+(s.sacks||0)*11+(s.defInt||0)*14+(s.ff||0)*7+(s.fr||0)*5+(s.defTD||0)*10;}
+function specialTeamsAwardScore(p){const s=p.seasonStats||emptyStats();return (s.fgm||0)*4-Math.max(0,(s.fga||0)-(s.fgm||0))*1.5+(s.xpm||0)+((s.krYds||0)+(s.prYds||0))*.025+((s.krTD||0)+(s.prTD||0))*10;}
+function awardCandidate(league,kind){
+  const all=allLeaguePlayers(league).filter(x=>(x.p.seasonStats?.gp||0)>0);let score;
+  if(kind==='Offensive Player of the Year')score=x=>offensiveAwardScore(x.p);
+  else if(kind==='Defensive Player of the Year')score=x=>defensiveAwardScore(x.p);
+  else if(kind==='Special Teams Player of the Year')score=x=>specialTeamsAwardScore(x.p);
+  else score=x=>Math.max(offensiveAwardScore(x.p),defensiveAwardScore(x.p)*1.05,specialTeamsAwardScore(x.p)*.9);
+  return all.sort((a,b)=>score(b)-score(a))[0]||null;
+}
+function determineSeasonAwards(league){
+  const types=['Most Valuable Player','Offensive Player of the Year','Defensive Player of the Year','Special Teams Player of the Year'];
+  return types.map(type=>{const x=awardCandidate(league,type);if(!x)return null;const scorer=type==='Defensive Player of the Year'?defensiveAwardScore:type==='Special Teams Player of the Year'?specialTeamsAwardScore:type==='Offensive Player of the Year'?offensiveAwardScore:(p=>Math.max(offensiveAwardScore(p),defensiveAwardScore(p)*1.05,specialTeamsAwardScore(p)*.9));return {type,playerId:x.p.id,teamId:x.t.id,name:x.p.name,position:x.p.position,score:Number(scorer(x.p).toFixed(2))};}).filter(Boolean);
+}
+function updateLeagueCareerRecords(league){
+  const rec=ensureLeagueRecords(league).career,all=[...league.teams.flatMap(t=>t.roster.map(p=>({p,t}))),...(league.freeAgents||[]).map(p=>({p,t:null})),...(league.retiredPlayers||[]).map(p=>({p,t:null}))];
+  for(const {p,t} of all){const st=p.stats||emptyStats(),meta={season:league.season,playerId:p.id,teamId:t?.id||p.teamId||null,name:p.name,position:p.position};
+    for(const [key,stat] of [['passingYards','passYds'],['passingTD','passTD'],['rushingYards','rushYds'],['rushingTD','rushTD'],['receivingYards','recYds'],['receivingTD','recTD'],['tackles','tackles'],['sacks','sacks'],['defInterceptions','defInt'],['fieldGoals','fgm'],['kickReturnYards','krYds']])setRecord(rec,key,st[stat]||0,meta);
+  }
+}
+function archiveCurrentSeason(league){
+  recalculateTeamRecords(league);updateLeagueSeasonRecords(league);updateLeagueCareerRecords(league);
+  const table=standings(league),championId=league.playoffState?.championTeamId||table[0]?.id||null,awards=determineSeasonAwards(league);
+  const snapshot={
+    season:league.season,championTeamId:championId,rules:deepClone(normalizeRules(league.rules)),phase:'complete',awards:deepClone(awards),
+    standings:table.map((t,i)=>({rank:i+1,teamId:t.id,name:t.name,abbr:t.abbr,w:t.wins,l:t.losses,t:t.ties,pf:t.pf,pa:t.pa,pointDiff:t.pf-t.pa})),
+    games:league.schedule.map(g=>deepClone(g)),
+    teamSeasons:league.teams.map(t=>({teamId:t.id,franchiseId:t.franchiseId||t.id,name:t.name,abbr:t.abbr,w:t.wins,l:t.losses,t:t.ties,pf:t.pf,pa:t.pa,stats:teamSeasonStats(league,t.id)})),
+    playerSeasons:league.teams.flatMap(t=>t.roster.map(p=>({playerId:p.id,teamId:t.id,name:p.name,position:p.position,age:p.age,stats:deepClone(p.seasonStats||emptyStats())}))),
+    playoffState:deepClone(league.playoffState),records:deepClone(ensureLeagueRecords(league)),transactions:deepClone((league.transactions||[]).filter(tx=>tx.season===league.season)),freeAgentCount:(league.freeAgents||[]).length,retiredCount:(league.retiredPlayers||[]).filter(p=>p.retiredSeason===league.season).length
+  };
+  league.completedSeasons.push(snapshot);league.history??=[];league.history.push({season:league.season,championTeamId:championId,rulesName:league.rules?.name||null,awards:deepClone(awards)});
+  for(const t of league.teams){
+    t.history??=[];t.history.push({season:league.season,champion:t.id===championId,w:t.wins,l:t.losses,t:t.ties,pf:t.pf,pa:t.pa});
+    for(const p of t.roster){p.history??=[];p.awards??=[];for(const a of awards.filter(a=>a.playerId===p.id))p.awards.push({season:league.season,type:a.type,teamId:t.id});p.history.push({season:league.season,teamId:t.id,teamName:t.name,teamAbbr:t.abbr,age:p.age,stats:deepClone(p.seasonStats||emptyStats())});}
+  }
+}
+function advanceSeason(league){
+  if(league.phase==='regularSeason'){
+    if(regularGames(league).some(g=>!g.played))throw new Error('Finish the regular season first.');
+    initializePlayoffs(league);
+    return;
+  }
+  if(league.phase==='playoffs'||league.phase==='championship'){
+    ensurePlayoffProgress(league);
+    if((league.schedule||[]).some(g=>g.stage==='playoff'&&!g.played))throw new Error('Finish the playoffs first.');
+    ensurePlayoffProgress(league);
+    if(league.phase!=='offseason')return;
+  }
+  if(league.phase!=='offseason')league.phase='offseason';
+  archiveCurrentSeason(league);
+  league.season++;league.phase='regularSeason';league.playoffState=null;
+  if(league.pendingRules){league.rules=normalizeRules(league.pendingRules);league.pendingRules=null;}
+  processOffseasonPlayerWorld(league);
+  for(const t of league.teams){
+    for(const p of t.roster)p.seasonStats=emptyStats();
+    Object.assign(t,{wins:0,losses:0,ties:0,pf:0,pa:0,gamesPlayed:0});
+    t.depthChart=null;ensureDepthChart(t,league.rules);
+  }
+  league.schedule=generateSchedule(league.teams,league.season,league.scheduleConfig);
+}
+
+function available(list){ return (list||[]).filter(p=>p.injuredGames<=0).sort((a,b)=>b.ratings.overall-a.ratings.overall); }
+function ensureDepthChart(team,rules){
+  const normalized=normalizeRules(rules),o=normalized.personnel.offenseSlots,dslots=normalized.personnel.defenseSlots;
+  if(team.depthChart&&team.depthChart.version===3)return team.depthChart;
+  const d=depthChart(team.roster),ids=x=>(x||[]).map(p=>p.id);
+  const wr=available(d.WR).slice(0,o.WR||1),ol=available(d.OL).slice(0,o.OL||2),db=available(d.DB).slice(0,dslots.DB||2),dl=available(d.DL).slice(0,dslots.DL||2),lb=available(d.LB).slice(0,Math.max(1,dslots.LB||1));
+  return team.depthChart={version:3,
+    offense:{QB:available(d.QB)[0]?.id||null,FB:(o.FB||0)>0?available(d.FB)[0]?.id||null:null,WR:ids(wr),OL:ids(ol),motion:wr[0]?.id||null},
+    defense:{DB:ids(db),DL:ids(dl),LB:lb[0]?.id||null,jack:lb[0]?.id||null,mac:lb[Math.min(1,lb.length-1)]?.id||lb[0]?.id||null},
+    special:{K:available(d.K)[0]?.id||null,returner:wr.slice().sort((a,b)=>(b.ratings.speed||0)-(a.ratings.speed||0))[0]?.id||null}};
+}
+function starters(team,rules){
+  const normalized=normalizeRules(rules),o=normalized.personnel.offenseSlots,dslots=normalized.personnel.defenseSlots,chart=ensureDepthChart(team,normalized),byId=new Map(team.roster.map(p=>[p.id,p])),healthy=team.roster.filter(p=>p.rosterStatus!=='inactive'&&(p.injuredGames||0)<=0);
+  const get=id=>{const p=byId.get(id);return p&&healthy.includes(p)?p:null;},gets=arr=>(arr||[]).map(get).filter(Boolean);
+  const exact=(pos,n=1,exclude=new Set())=>healthy.filter(p=>p.position===pos&&!exclude.has(p.id)).sort((a,b)=>effective(b,'overall')-effective(a,'overall')).slice(0,n);
+  const emergency=(role,n=1,exclude=new Set())=>healthy.filter(p=>!exclude.has(p.id)).sort((a,b)=>roleGrade(b,role)-roleGrade(a,role)).slice(0,n);
+  const one=(preferred,pos,role)=>{
+    const p=get(preferred);if(p)return p;
+    return exact(pos,1)[0]||emergency(role,1)[0]||null;
+  };
+  const many=(preferred,pos,n,role,exclude=new Set())=>{
+    const chosen=gets(preferred).filter(p=>!exclude.has(p.id));
+    const used=new Set([...exclude,...chosen.map(p=>p.id)]);
+    for(const p of exact(pos,n,used)){if(chosen.length<n){chosen.push(p);used.add(p.id);}}
+    for(const p of emergency(role,n,used)){if(chosen.length<n){chosen.push(p);used.add(p.id);}}
+    return chosen.slice(0,n);
+  };
+  const qb=one(chart.offense.QB,'QB','passer'),fb=(o.FB||0)>0?one(chart.offense.FB,'FB','runner'):null,wr=many(chart.offense.WR,'WR',o.WR||1,'receiver'),ol=many(chart.offense.OL,'OL',o.OL||2,'passBlock');
+  const k=one(chart.special.K,'K','overall'),returner=get(chart.special.returner)||best(wr,'receiver')||fb||emergency('runner',1)[0]||null,motionReceiver=get(chart.offense.motion)||wr[0]||null;
+  let db=many(chart.defense.DB,'DB',dslots.DB||2,'coverage'),dl=many(chart.defense.DL,'DL',dslots.DL||2,'passRush'),lb=(dslots.LB||0)>0?one(chart.defense.LB,'LB','tackle'):null,jack=(dslots.LB||0)>0?one(chart.defense.jack,'LB','coverage'):null,mac=(dslots.LB||0)>0?one(chart.defense.mac,'LB','tackle'):null;
+  if(normalized.ironman||normalized.personnel?.ironman){
+    const ironDB=[...wr,...db].filter(Boolean),ironDL=[...ol,...dl].filter(Boolean);
+    db=[...new Map(ironDB.map(p=>[p.id,p])).values()].slice(0,dslots.DB||2);
+    dl=[...new Map(ironDL.map(p=>[p.id,p])).values()].slice(0,dslots.DL||2);
+    if((dslots.LB||0)>0){lb=fb||lb||best(wr,'tackle');jack=lb||jack;mac=lb||mac;}
+  }
+  return {qb,fb,wr,ol,k,returner,motionReceiver,db,dl,lb,jack,mac};
+}
+function lineupParticipants(lineup){
+  return [...new Map([lineup.qb,lineup.fb,...(lineup.wr||[]),...(lineup.ol||[]),...(lineup.db||[]),...(lineup.dl||[]),lineup.lb,lineup.k,lineup.returner].filter(Boolean).map(p=>[p.id,p])).values()];
+}
+function offenseParticipants(lineup){return [...new Map([lineup.qb,lineup.fb,...(lineup.wr||[]),...(lineup.ol||[])].filter(Boolean).map(p=>[p.id,p])).values()];}
+function defenseParticipants(lineup){return [...new Map([...(lineup.db||[]),...(lineup.dl||[]),lineup.lb].filter(Boolean).map(p=>[p.id,p])).values()];}
+function validateLineup(team,lineup,rules){
+  const normalized=normalizeRules(rules),issues=[],need=normalized.personnel.playersPerSide,o=normalized.personnel.offenseSlots,d=normalized.personnel.defenseSlots;
+  if((o.QB||0)>0&&!lineup.qb)issues.push('missing QB');
+  if(!lineup.k)issues.push('missing K');
+  if((lineup.wr||[]).length<(o.WR||0))issues.push('not enough WR');
+  if((lineup.ol||[]).length<(o.OL||0))issues.push('not enough OL');
+  if((lineup.db||[]).length<(d.DB||0))issues.push('not enough DB');
+  if((lineup.dl||[]).length<(d.DL||0))issues.push('not enough DL');
+  if((d.LB||0)>0&&!lineup.lb)issues.push('missing LB');
+  const healthy=new Set(team.roster.filter(p=>p.rosterStatus!=='inactive'&&(p.injuredGames||0)<=0).map(p=>p.id));
+  for(const p of lineupParticipants(lineup))if(!healthy.has(p.id))issues.push(`ineligible ${p.id}`);
+  const offenseCount=(lineup.qb?1:0)+(lineup.fb?1:0)+(lineup.wr||[]).length+(lineup.ol||[]).length;
+  const defenseCount=(lineup.db||[]).length+(lineup.dl||[]).length+(lineup.lb?1:0);
+  if(offenseCount!==need)issues.push(`offense has ${offenseCount}, rules require ${need}`);
+  if(defenseCount!==need)issues.push(`defense has ${defenseCount}, rules require ${need}`);
+  if(normalized.ironman||normalized.personnel?.ironman){
+    const offense=new Set([lineup.fb,...(lineup.wr||[]),...(lineup.ol||[])].filter(Boolean).map(p=>p.id)),defense=new Set([lineup.lb,...(lineup.db||[]),...(lineup.dl||[])].filter(Boolean).map(p=>p.id));
+    const overlap=[...offense].filter(id=>defense.has(id)).length,target=Math.max(1,need-(normalized.personnel.specialistExemptions||['QB','K']).filter(x=>x==='QB').length);
+    if(overlap<Math.min(target,offense.size))issues.push(`ironman overlap ${overlap} below target ${Math.min(target,offense.size)}`);
+  }
+  return issues;
+}
+function maybeRefreshPersonnel(team,lineup,rules){
+  const mode=rules.personnel?.substitutionMode||((rules.ironman||rules.personnel?.ironman)?'ironman':'free');
+  if(mode==='ironman')return lineup;
+  const tired=lineupParticipants(lineup).some(p=>(p.fatigue||0)>72);
+  return tired?starters(team,rules):lineup;
+}
+function recoverNonParticipants(team,lineup,rules){
+  const active=new Set(lineupParticipants(lineup).map(p=>p.id)),amount=rules.injuries?.recoveryBetweenPlays??.35;
+  for(const p of team.roster)if(!active.has(p.id))p.fatigue=clamp((p.fatigue||0)-amount,0,100);
+}
+function avg(list,key='overall',fallback=45){
+  const vals=(list||[]).filter(Boolean).map(p=>p.ratings?.[key]??p.ratings?.overall??fallback);
+  return vals.length?vals.reduce((a,b)=>a+b,0)/vals.length:fallback;
+}
+function fatiguePenalty(p){ return p?Math.min(16,(p.fatigue||0)*0.22):8; }
+function effective(p,key='overall'){ return p?clamp((p.ratings?.[key]??p.ratings?.overall??45)-fatiguePenalty(p),20,99):35; }
+function addStat(p,key,n=1){ if(p){p.stats??=emptyStats();p.stats[key]=(p.stats[key]||0)+n;} }
+function teamSideBox(teamId,home,box){ return teamId===home.id?box.home:box.away; }
+function normalizeRules(rules){
+  const old=rules||{},r={...deepClone(DEFAULT_RULES),...old};
+  r.field={...DEFAULT_RULES.field,...(old.field||{}),length:old.fieldLength??old.field?.length??50,width:old.fieldWidth??old.field?.width??28,endZoneDepth:old.endZoneLength??old.field?.endZoneDepth??8,walls:(old.wallsInPlay??true)?'live':'boundary'};
+  r.personnel={...DEFAULT_RULES.personnel,...(old.personnel||{}),playersPerSide:old.playersOnField??old.personnel?.playersPerSide??8,ironman:old.ironman??old.personnel?.ironman??true,motionPlayers:old.secondMotionMan?2:(old.motion?.offensivePlayers??old.personnel?.motionPlayers??1),highMotion:old.highMotion??old.personnel?.highMotion??true};
+  const slotDefaults=slotCountsFor(r.personnel.playersPerSide);
+  r.personnel.offenseSlots={...slotDefaults.offense,...(old.personnel?.offenseSlots||{})};
+  r.personnel.defenseSlots={...slotDefaults.defense,...(old.personnel?.defenseSlots||{})};
+  r.defense={...DEFAULT_RULES.defense,...(old.defense||{}),jackRestriction:old.jackRestrictions??old.defense?.jackRestriction??'classic'};
+  r.kicking={...deepClone(DEFAULT_RULES.kicking),...(old.kicking||{}),punting:old.punting??old.kicking?.punting??false,reboundNets:old.reboundNets??old.kicking?.reboundNets??true,dropKicks:old.dropKicks??old.kicking?.dropKicks??true,halo:old.halo??old.kicking?.halo??true};
+  r.kicking.deuce={...DEFAULT_RULES.kicking.deuce,...(old.kicking?.deuce||{}),enabled:old.deuce??old.kicking?.deuce?.enabled??true};r.kicking.uno={...DEFAULT_RULES.kicking.uno,...(old.kicking?.uno||{}),enabled:old.uno??old.kicking?.uno?.enabled??false};r.kicking.rouge={...DEFAULT_RULES.kicking.rouge,...(old.kicking?.rouge||{}),enabled:old.rouge??old.kicking?.rouge?.enabled??true};
+  r.motion={...DEFAULT_RULES.motion,...(old.motion||{}),offensivePlayers:r.personnel.motionPlayers,forwardMotionAllowed:old.highMotion??old.motion?.forwardMotionAllowed??true};r.clock={...DEFAULT_RULES.clock,...(old.clock||{}),runningClock:old.runningClock??old.clock?.runningClock??true};
+  r.overtime={...DEFAULT_RULES.overtime,...(old.overtime||{})};r.penalties={...DEFAULT_RULES.penalties,...(old.penalties||{})};r.injuries={...DEFAULT_RULES.injuries,...(old.injuries||{})};r.scoring={...DEFAULT_RULES.scoring,...(old.scoring||{})};
+  Object.assign(r,{fieldLength:r.field.length,fieldWidth:r.field.width,endZoneLength:r.field.endZoneDepth,playersOnField:r.personnel.playersPerSide,ironman:r.personnel.ironman,highMotion:r.personnel.highMotion,reboundNets:r.kicking.reboundNets,punting:r.kicking.punting,dropKicks:r.kicking.dropKicks,deuce:r.kicking.deuce.enabled,uno:r.kicking.uno.enabled,rouge:r.kicking.rouge.enabled,halo:r.kicking.halo,jackRestrictions:r.defense.jackRestriction});
+  return r;
+}
+function scoreDiff(state,teamId,home){ return teamId===home.id?state.homeScore-state.awayScore:state.awayScore-state.homeScore; }
+const OFFENSE_CONCEPTS={
+  RUN_POWER:{family:'run',lane:'inside',label:'Power',runBlock:+3,breakTackle:+2,motionPlayers:0},
+  RUN_SWEEP:{family:'run',lane:'outside',label:'Sweep',runBlock:-1,space:+4,motionPlayers:1},
+  DRAW:{family:'run',lane:'inside',label:'Draw',runBlock:+1,vsBlitz:+7,motionPlayers:0},
+  SLANT:{family:'pass',depth:'short',label:'Slant',release:+4,vsMan:+5,vsBlitz:+3,motionPlayers:1},
+  QUICK_OUT:{family:'pass',depth:'short',label:'Quick Out',release:+3,vsZone:+3,outBounds:.38,motionPlayers:1},
+  CROSS:{family:'pass',depth:'medium',label:'Cross',vsMan:+4,yac:+3,motionPlayers:1},
+  CORNER:{family:'pass',depth:'medium',label:'Corner',vsZone:+5,catchPenalty:2,motionPlayers:1},
+  VERTICALS:{family:'pass',depth:'deep',label:'Verticals',vsMan:+2,explosive:+5,motionPlayers:1},
+  SCREEN:{family:'pass',depth:'screen',label:'Screen',vsBlitz:+9,yac:+5,passRushRelief:+7,motionPlayers:0}
+};
+const DEFENSE_CALLS={
+  MAN:{label:'Man',coverage:'man',coverageMod:1,pressureMod:0,runFit:0},
+  ZONE:{label:'Zone',coverage:'zone',coverageMod:2,pressureMod:-1,runFit:0},
+  BLITZ:{label:'Blitz',coverage:'man',coverageMod:-4,pressureMod:8,runFit:2},
+  RUN_FIT:{label:'Run Fit',coverage:'zone',coverageMod:-2,pressureMod:1,runFit:7},
+  RED_ZONE:{label:'Red Zone',coverage:'zone',coverageMod:5,pressureMod:2,runFit:3}
+};
+function playInfo(play){return OFFENSE_CONCEPTS[play]||OFFENSE_CONCEPTS.SLANT;}
+function legalDefensiveCalls(state,rules){
+  const calls=['MAN','ZONE','RUN_FIT','RED_ZONE'];
+  const unrestricted=rules.defense?.allowFreeBlitz||rules.jackRestrictions==='none'||rules.defense?.jackRestriction==='none';
+  if(unrestricted || (rules.defense?.maxBlitzers||0)>0) calls.push('BLITZ');
+  return calls;
+}
+function defensiveCall(state,rules){
+  const legal=new Set(legalDefensiveCalls(state,rules)),red=state.yardLine>=rules.fieldLength-10;
+  const pool=red?[['RED_ZONE',5],['MAN',2],['BLITZ',2],['RUN_FIT',1]]:
+    state.down>=3&&state.toGo>=6?[['BLITZ',4],['ZONE',4],['MAN',2]]:
+    state.toGo<=2?[['RUN_FIT',5],['MAN',3],['BLITZ',2]]:
+    [['MAN',3],['ZONE',4],['BLITZ',2],['RUN_FIT',1]];
+  return weighted(pool.filter(([call])=>legal.has(call)));
+}
+function coachDecision(state,team,home,rules){
+  const distGoal=rules.fieldLength-state.yardLine,diff=scoreDiff(state,team.id,home),late=state.quarter>=4&&state.seconds<=180;
+  if(late&&diff>0&&state.seconds<=95&&state.down<rules.downs&&state.toGo<=rules.firstDownDistance)return 'KNEEL';
+  if(late&&diff<0&&state.seconds<=45&&state.clockRunning&&state.down<rules.downs&&state.toGo>3)return 'SPIKE';
+  if(state.down===rules.downs){
+    const fgDist=distGoal+8,desperate=late&&diff<0;
+    if(!desperate&&fgDist<=34&&state.yardLine>=14)return (rules.dropKicks&&rules.fourPointDropFieldGoal&&random()<.08)?'DROP_FG':'FG';
+    if(rules.punting&&!desperate&&state.yardLine<rules.fieldLength*.42&&state.toGo>=4)return 'PUNT';
+    if(state.toGo<=3||desperate||state.yardLine>=30)return state.toGo<=1?'RUN_POWER':weighted([['SLANT',4],['CROSS',3],['QUICK_OUT',2],['DRAW',1]]);
+    return 'TURNOVER';
+  }
+  if(late&&diff<=-8)return weighted([['QUICK_OUT',3],['CROSS',5],['CORNER',3],['VERTICALS',2],['SCREEN',1]]);
+  if(state.toGo>=11)return weighted([['CROSS',4],['CORNER',3],['VERTICALS',2],['SCREEN',2],['DRAW',1]]);
+  if(state.down===3&&state.toGo>=6)return weighted([['SLANT',2],['CROSS',5],['CORNER',3],['VERTICALS',1],['SCREEN',1]]);
+  if(state.yardLine>=rules.fieldLength-8)return weighted([['RUN_POWER',3],['SLANT',4],['QUICK_OUT',2],['CORNER',2],['DRAW',1]]);
+  return weighted([['RUN_POWER',18],['RUN_SWEEP',11],['DRAW',5],['SLANT',20],['QUICK_OUT',13],['CROSS',17],['CORNER',8],['VERTICALS',5],['SCREEN',3]]);
+}
+function roleGrade(p,role){
+  if(!p)return 35;const v=k=>effective(p,k);
+  switch(role){
+    case'passer':return .22*v('decision')+.18*v('awareness')+.16*v('passShort')+.16*v('passMedium')+.12*v('passDeep')+.10*v('armStrength')+.06*v('scramble');
+    case'runner':return .20*v('vision')+.18*v('acceleration')+.16*v('agility')+.15*v('breakTackle')+.12*v('power')+.11*v('speed')+.08*v('ballSecurity');
+    case'receiver':return .24*v('routeRunning')+.20*v('catching')+.16*v('release')+.14*v('speed')+.10*v('contestedCatch')+.08*v('motion')+.08*v('awareness');
+    case'passBlock':return .40*v('passBlock')+.25*v('blockStrength')+.20*v('strength')+.15*v('awareness');
+    case'runBlock':return .40*v('runBlock')+.30*v('blockStrength')+.20*v('strength')+.10*v('awareness');
+    case'passRush':return .38*v('passRush')+.22*v('blockShedding')+.16*v('acceleration')+.14*v('strength')+.10*v('awareness');
+    case'runDefense':return .30*v('blockShedding')+.25*v('tackling')+.20*v('strength')+.15*v('pursuit')+.10*v('awareness');
+    case'coverage':return .28*v('manCoverage')+.24*v('zoneCoverage')+.18*v('speed')+.15*v('agility')+.15*v('awareness');
+    case'tackle':return .40*v('tackling')+.20*v('strength')+.20*v('pursuit')+.12*v('awareness')+.08*v('agility');
+    default:return v('overall');
+  }
+}
+function matchupProbability(a,b,scale=11){ return clamp(1/(1+Math.exp(-(a-b)/scale)),.05,.95); }
+function named(p,fallback='player'){ return p?.name||fallback; }
+function best(list,role){ return (list||[]).filter(Boolean).slice().sort((a,b)=>roleGrade(b,role)-roleGrade(a,role))[0]||null; }
+function pickWeightedPlayers(list,role){
+  const usable=(list||[]).filter(Boolean); if(!usable.length)return null;
+  const floor=Math.min(...usable.map(p=>roleGrade(p,role)))-10;
+  return weighted(usable.map(p=>[p,Math.max(1,roleGrade(p,role)-floor)]));
+}
+function selectRunDefender(def,outside){
+  if(outside) return pickWeightedPlayers([...(def.db||[]),def.lb].filter(Boolean),'tackle');
+  return pickWeightedPlayers([...(def.dl||[]),def.lb,...(def.db||[]).slice(0,1)].filter(Boolean),'runDefense');
+}
+function resolveRunBlocking(off,def,play,defCall){
+  const info=playInfo(play),outside=info.lane==='outside',call=DEFENSE_CALLS[defCall]||DEFENSE_CALLS.ZONE;
+  const blockers=(off.ol||[]).filter(Boolean), primaryBlocker=pickWeightedPlayers(blockers,'runBlock');
+  const primaryDef=outside?pickWeightedPlayers([def.lb,...(def.db||[])].filter(Boolean),'runDefense'):pickWeightedPlayers([...(def.dl||[]),def.lb].filter(Boolean),'runDefense');
+  const b=roleGrade(primaryBlocker,'runBlock')+(info.runBlock||0)+(defCall==='BLITZ'&&info.vsBlitz?info.vsBlitz:0);
+  const d=roleGrade(primaryDef,'runDefense')+(call.runFit||0);
+  const win=matchupProbability(b,d,10),roll=random();
+  const level=roll<win*.34?'dominant':roll<win?'win':roll<win+(1-win)*.55?'draw':'loss';
+  return{blocker:primaryBlocker,defender:primaryDef,level,edge:b-d};
+}
+function runSnap(off,def,play,defCall='ZONE',rules=DEFAULT_RULES){
+  const info=playInfo(play),outside=info.lane==='outside',carrier=off.fb,block=resolveRunBlocking(off,def,play,defCall);
+  const runner=roleGrade(carrier,'runner')+(info.breakTackle||0),tackler=selectRunDefender(def,outside),tackle=roleGrade(tackler,'tackle');
+  let base=block.level==='dominant'?randInt(3,7):block.level==='win'?randInt(1,5):block.level==='draw'?randInt(0,4):randInt(-3,1);
+  if(outside)base+=Math.round((effective(carrier,'speed')-65)/12)+(info.space||0)/2; else base+=Math.round((effective(carrier,'strength')-65)/14);
+  if(play==='DRAW'&&defCall==='BLITZ')base+=randInt(2,6);
+  const tackleWin=matchupProbability(tackle,runner,12);if(random()>tackleWin){base+=randInt(2,7);if(random()<.11)base+=randInt(4,9);}
+  const yards=clamp(Math.round(base),-6,24),hitPower=tackle-runner,fumbleChance=clamp(.012+hitPower/3200+fatiguePenalty(carrier)/800,.004,.05);
+  return{type:'run',play,concept:info.label,defCall,yards,complete:true,outOfBounds:outside&&random()<.22,fumble:random()<fumbleChance,carrier,tackler,blocker:block.blocker,blockDefender:block.defender,blockResult:block.level,
+    desc:`${info.label} vs ${DEFENSE_CALLS[defCall].label}: ${named(carrier,'Runner')} for ${yards} yard${Math.abs(yards)===1?'':'s'} (${block.level} block by ${named(block.blocker,'OL')})`};
+}
+function resolvePassProtection(off,def,play,defCall){
+  const info=playInfo(play),call=DEFENSE_CALLS[defCall]||DEFENSE_CALLS.ZONE,rushers=[...(def.dl||[]),def.lb].filter(Boolean);
+  const rusher=best(rushers,'passRush'),blocker=pickWeightedPlayers(off.ol||[],'passBlock');
+  const rush=roleGrade(rusher,'passRush')+(call.pressureMod||0),block=roleGrade(blocker,'passBlock')+(info.passRushRelief||0);
+  const depth=info.depth==='deep'?1.25:info.depth==='medium'?1.08:info.depth==='screen'?.72:.92;
+  const pressureChance=clamp((1-matchupProbability(block,rush,10))*.62*depth+.05,.04,.64),pressured=random()<pressureChance;
+  const sackChance=pressured?clamp(.18+(rush-block)/180,.06,.48):clamp(.025+(rush-block)/600,.008,.08);
+  return{rusher,blocker,pressured,sack:random()<sackChance,edge:block-rush};
+}
+function coverageAssignments(def,receivers,defCall){
+  const call=DEFENSE_CALLS[defCall]||DEFENSE_CALLS.ZONE,db=(def.db||[]).filter(Boolean).slice().sort((a,b)=>roleGrade(b,'coverage')-roleGrade(a,'coverage'));
+  if(call.coverage==='zone')return receivers.map((rec,i)=>({receiver:rec,defender:db[(i+1)%Math.max(1,db.length)]||def.lb||null}));
+  return receivers.map((rec,i)=>({receiver:rec,defender:db[i%Math.max(1,db.length)]||def.lb||null}));
+}
+function receiverSeparation(rec,db,play,defCall){
+  const info=playInfo(play),call=DEFENSE_CALLS[defCall]||DEFENSE_CALLS.ZONE,rr=roleGrade(rec,'receiver'),cov=roleGrade(db,'coverage')+(call.coverageMod||0);
+  const depthPenalty=info.depth==='deep'?5:info.depth==='medium'?2:0;
+  let concept=info.release||0;
+  if(call.coverage==='man')concept+=info.vsMan||0;else concept+=info.vsZone||0;
+  if(defCall==='BLITZ')concept+=info.vsBlitz||0;
+  const noise=(random()+random()+random()-1.5)*9;
+  return rr-cov-depthPenalty+concept+noise;
+}
+function chooseTarget(off,def,play,defCall,qbAwarenessPenalty=0){
+  const receivers=(off.wr||[]).filter(Boolean);if(off.fb)receivers.push(off.fb);if(!receivers.length)return{receiver:null,defender:null,separation:-10};
+  const assigns=coverageAssignments(def,receivers,defCall).map(x=>({...x,separation:receiverSeparation(x.receiver,x.defender,play,defCall)}));
+  const read=Math.max(0,(roleGrade(off.qb,'passer')-50-qbAwarenessPenalty)/18),weights=assigns.map((x,i)=>[x,Math.max(.4,5+x.separation+read-(i*.35))]);
+  return weighted(weights);
+}
+function passSnap(off,def,play,defCall='ZONE',rules=DEFAULT_RULES){
+  const info=playInfo(play),qb=off.qb,prot=resolvePassProtection(off,def,play,defCall);
+  if(prot.sack){const y=-randInt(2,8);return{type:'pass',play,concept:info.label,defCall,yards:y,sack:true,qb,defender:prot.rusher,blocker:prot.blocker,pressured:true,tackler:prot.rusher,desc:`${info.label} vs ${DEFENSE_CALLS[defCall].label}: ${named(prot.rusher,'Rusher')} sacks ${named(qb,'QB')} for ${Math.abs(y)} yard loss`};}
+  const target=chooseTarget(off,def,play,defCall,prot.pressured?8:0),rec=target.receiver,cover=target.defender,passer=roleGrade(qb,'passer'); if(rec&&rules.highMotion&&(info.motionPlayers||0)>0&&off.motionReceiver?.id===rec.id)target.separation+=(effective(rec,'motion')-60)/8+3;
+  const depth=info.depth==='deep'?3:info.depth==='medium'?2:info.depth==='screen'?0:1;
+  const accuracyBase=depth===0?.88:depth===1?.76:depth===2?.61:.45;
+  const accuracy=clamp(accuracyBase+(passer-65)/180+target.separation/170-(prot.pressured?.16:0),.20,.95),throwRoll=random();
+  const intRisk=clamp((depth===3?.055:depth===2?.035:depth===0?.008:.018)+(roleGrade(cover,'coverage')-passer)/1500-target.separation/1000+(prot.pressured?.018:0),.004,.12);
+  if(throwRoll<intRisk)return{type:'pass',play,concept:info.label,defCall,yards:0,turnover:true,interception:true,qb,receiver:rec,defender:cover,pressured:prot.pressured,desc:`${info.label} vs ${DEFENSE_CALLS[defCall].label}: ${named(cover,'Defender')} intercepts ${named(qb,'QB')} targeting ${named(rec,'receiver')}`};
+  if(throwRoll>accuracy)return{type:'pass',play,concept:info.label,defCall,yards:0,incomplete:true,qb,receiver:rec,defender:cover,pressured:prot.pressured,desc:`${info.label} vs ${DEFENSE_CALLS[defCall].label}: ${named(qb,'QB')} incomplete to ${named(rec,'receiver')}`};
+  const catchSkill=roleGrade(rec,'receiver'),contest=roleGrade(cover,'coverage'),catchChance=clamp(.79+(catchSkill-contest)/210+target.separation/95-(depth===3?.09:depth===2?.04:0)-(info.catchPenalty||0)/100,.38,.98);
+  if(random()>catchChance)return{type:'pass',play,concept:info.label,defCall,yards:0,incomplete:true,drop:true,qb,receiver:rec,defender:cover,pressured:prot.pressured,desc:`${info.label} vs ${DEFENSE_CALLS[defCall].label}: ${named(rec,'Receiver')} cannot secure ${named(qb,'QB')}'s pass`};
+  const air=depth===3?randInt(10,21):depth===2?randInt(5,11):depth===0?randInt(-2,2):randInt(1,6),tackle=roleGrade(cover,'tackle'),yacSkill=.62*effective(rec,'speed')+.38*effective(rec,'strength')+(info.yac||0);
+  let yac=Math.max(0,Math.round(randInt(0,4)+(yacSkill-tackle)/13));if(depth===0)yac+=randInt(2,6);if(random()<clamp((yacSkill-tackle+30+(info.explosive||0))/300,.03,.15))yac+=randInt(4,9);
+  let yards=clamp(air+yac,-2,32);const fumbleChance=clamp(.007+(tackle-yacSkill)/3500+fatiguePenalty(rec)/1100,.003,.028);
+  const boundary=random()<(info.outBounds||.13),wallContact=!!rules.wallsInPlay&&boundary;
+  if(wallContact){const wallPenalty=Math.max(0,Math.round((62-effective(rec,'wallAwareness'))/12));yards=clamp(yards-wallPenalty,-2,32);}
+  return{type:'pass',play,concept:info.label,defCall,yards,complete:true,receiver:rec,qb,defender:cover,tackler:cover,fumble:random()<fumbleChance,outOfBounds:boundary&&!rules.wallsInPlay,wallContact,pressured:prot.pressured,airYards:air,yac,
+    desc:`${info.label} vs ${DEFENSE_CALLS[defCall].label}: ${named(qb,'QB')} to ${named(rec,'receiver')} for ${yards} yards (${air} air, ${yac} YAC${wallContact?', wall contact':''})`};
+}
+function fieldGoalChance(k,distance,drop=false){
+  const accuracy=effective(k,drop?'dropKick':'kickAccuracy'),power=effective(k,'kickPower'),rangePenalty=Math.max(0,distance-(18+(power-60)*.18));
+  return clamp(.93-rangePenalty*.035+(accuracy-65)*.006,.05,.985);
+}
+function kickoff(offTeam,defTeam,off,def,rules,state,emit,box,home){
+  const returner=off.returner||off.wr.slice().sort((a,b)=>effective(b,'speed')-effective(a,'speed'))[0]||off.fb,k=def.k,power=effective(k,'kickoff'),accuracy=effective(k,'kickAccuracy');
+  const depth=clamp(Math.round(38+(power-60)*.22+randInt(-7,7)),20,rules.fieldLength+8),lateral=randInt(-Math.ceil(rules.fieldWidth/2)-4,Math.ceil(rules.fieldWidth/2)+4);
+  emit('kick_trajectory',{kickingTeamId:defTeam.id,receivingTeamId:offTeam.id,kickerId:k?.id||null,depth,lateral},`${defTeam.abbr} kickoff travels ${depth} yards`);
+  if(Math.abs(lateral)>rules.fieldWidth/2){
+    state.yardLine=rules.kickoffOutOfBoundsSpot||rules.kicking?.kickoffOutOfBoundsSpot||20;
+    emit('kickoff_out_of_bounds',{kickingTeamId:defTeam.id,receivingTeamId:offTeam.id,spot:state.yardLine},`${defTeam.abbr} kickoff goes out of bounds; ${offTeam.abbr} starts at ${state.yardLine}`);
+    return;
+  }
+  const through=depth>=rules.fieldLength+2&&Math.abs(lateral)<=3&&random()<clamp(.35+(accuracy-60)*.008,.15,.75);
+  if(rules.kicking?.deuce?.enabled&&through){
+    const pts=rules.kicking.deuce.points||2;if(defTeam.id===home.id)state.homeScore+=pts;else state.awayScore+=pts;
+    emit('deuce',{teamId:defTeam.id,kickerId:k?.id||null,points:pts},`${defTeam.abbr} DEUCE! ${pts} points on the kickoff`);
+  }
+  if(depth>=rules.fieldLength&&rules.reboundNets){
+    const reboundSpot=clamp(rules.fieldLength-randInt(2,12),1,rules.fieldLength-1),coverage=Math.max(35,avg([...(def.db||[]),...(def.dl||[]),def.lb].filter(Boolean),'speed')),returnSkill=(effective(returner,'speed')+effective(returner,'agility'))/2;
+    let ret=clamp(reboundSpot+randInt(-5,10)+Math.round((returnSkill-coverage)/10),1,rules.fieldLength-1);
+    emit('rebound_net',{kickingTeamId:defTeam.id,receivingTeamId:offTeam.id,reboundSpot},`Kick strikes the rebound net and comes back to ${reboundSpot}`);
+    if(rules.kicking?.halo&&random()<(rules.kicking.haloViolationRate||0)){
+      ret=clamp(ret+5,1,rules.fieldLength-1);
+      emit('halo_violation',{teamId:defTeam.id,receivingTeamId:offTeam.id,penaltyYards:5,spot:ret},`${defTeam.abbr} violates the return halo; 5 yards added`);
+    }
+    state.yardLine=ret;
+    emit('kickoff_rebound_return',{kickingTeamId:defTeam.id,receivingTeamId:offTeam.id,returnerId:returner?.id||null,returnYards:ret,spot:ret,rebound:true},`${named(returner,'Returner')} fields the rebound and returns to ${ret}`);
+    return;
+  }
+  if(depth>=rules.fieldLength-2){
+    if(rules.kicking?.rouge?.enabled&&rules.kicking.rouge.trigger==='kick_dead_end_zone'&&!through){
+      const pts=rules.kicking.rouge.points||1;if(defTeam.id===home.id)state.homeScore+=pts;else state.awayScore+=pts;
+      state.yardLine=rules.kicking.rouge.spot??rules.touchbackSpot;
+      emit('rouge',{teamId:defTeam.id,receivingTeamId:offTeam.id,kickerId:k?.id||null,points:pts,spot:state.yardLine},`${defTeam.abbr} scores a ROUGE; ${offTeam.abbr} starts at ${state.yardLine}`);
+    }else{
+      state.yardLine=rules.touchbackSpot;
+      emit('kickoff_touchback',{kickingTeamId:defTeam.id,receivingTeamId:offTeam.id,spot:state.yardLine},`${offTeam.abbr} starts at ${state.yardLine}`);
+    }
+    return;
+  }
+  const coverage=Math.max(35,avg([...(def.db||[]),...(def.dl||[]),def.lb].filter(Boolean),'speed')),returnSkill=(effective(returner,'speed')+effective(returner,'agility'))/2;
+  const ret=clamp(randInt(5,15)+Math.round((returnSkill-coverage)/8),1,rules.fieldLength-1);state.yardLine=ret;
+  emit('kickoff_return',{kickingTeamId:defTeam.id,receivingTeamId:offTeam.id,returnerId:returner?.id||null,returnYards:ret,spot:ret},`${named(returner,'Returner')} returns the kickoff to ${ret}`);
+}
+function punt(offTeam,defTeam,off,def,rules,state,emit){
+  const kicker=off.k,power=effective(kicker,'kickPower'),accuracy=effective(kicker,'kickAccuracy'),returner=def.returner||def.wr?.[0]||def.fb;
+  const gross=clamp(Math.round(30+(power-60)*.18+randInt(-7,7)),rules.kicking?.puntMinDistance||18,48);
+  const landing=state.yardLine+gross;
+  emit('punt',{teamId:offTeam.id,kickerId:kicker?.id||null,grossYards:gross},`${offTeam.abbr} punts ${gross} yards`);
+  if(landing>=rules.fieldLength){
+    if(rules.reboundNets){
+      const reboundSpot=clamp(rules.fieldLength-randInt(2,10),1,rules.fieldLength-1),ret=clamp(randInt(0,10)+Math.round((effective(returner,'speed')-65)/9),0,16),spot=clamp(rules.fieldLength-reboundSpot+ret,rules.touchbackSpot,rules.fieldLength-1);
+      emit('punt_rebound',{teamId:offTeam.id,receivingTeamId:defTeam.id,reboundSpot,returnerId:returner?.id||null,returnYards:ret,spot},`Punt hits the rebound net; ${named(returner,'Returner')} returns it ${ret} yards`);
+      return spot;
+    }
+    emit('punt_touchback',{teamId:offTeam.id,receivingTeamId:defTeam.id,spot:rules.touchbackSpot},`Punt reaches the end zone for a touchback`);
+    return rules.touchbackSpot;
+  }
+  const returnYards=clamp(randInt(0,10)+Math.round((effective(returner,'speed')-65)/10),0,16),base=rules.fieldLength-landing,spot=clamp(base+returnYards,rules.touchbackSpot,rules.fieldLength-1);
+  emit('punt_return',{teamId:offTeam.id,receivingTeamId:defTeam.id,returnerId:returner?.id||null,returnYards,spot},`${named(returner,'Returner')} returns the punt ${returnYards} yards`);
+  return spot;
+}
+function preSnapPenalty(off,def,rules,play,defCall){
+  if(!rules.penalties.enabled)return null;
+  const info=playInfo(play),allowedMotion=Math.max(0,rules.motion?.offensivePlayers??rules.personnel?.motionPlayers??0);
+  const motionUsed=allowedMotion>0&&rules.highMotion?Math.min(info.motionPlayers??(off.motionReceiver?1:0),allowedMotion):0,motionEligible=motionUsed===0||!off.motionReceiver||((rules.motion?.eligiblePositions||['WR']).includes(off.motionReceiver.position));
+  const executionRisk=(rules.motion?.illegalExecutionRate??rules.penalties.illegalMotionRate??0);
+  if(motionUsed>allowedMotion||!motionEligible||(motionUsed>0&&random()<executionRisk))return{side:'offense',name:'Illegal motion',yards:5,noPlay:true};
+  const callLegal=legalDefensiveCalls({down:1,toGo:10,yardLine:25},rules).includes(defCall);
+  const awareness=avg([...(def.db||[]),...(def.dl||[]),def.lb].filter(Boolean),'awareness',60),alignmentRisk=clamp((rules.defense?.alignmentErrorRate||rules.penalties.illegalDefenseRate||0)+(65-awareness)/5000,0,.03);
+  if(!callLegal||random()<alignmentRisk)return{side:'defense',name:'Illegal defense',yards:5,automaticFirst:true,noPlay:true};
+  return null;
+}
+function maybePenalty(offTeam,defTeam,rules){
+  if(!rules.penalties.enabled)return null;
+  const r=random();
+  if(r<rules.penalties.offensiveRate) return choice([{side:'offense',name:'False start',yards:5,noPlay:true},{side:'offense',name:'Holding',yards:10,noPlay:false}]);
+  if(r<rules.penalties.offensiveRate+rules.penalties.defensiveRate) return choice([{side:'defense',name:'Illegal contact',yards:5,automaticFirst:true},{side:'defense',name:'Defensive holding',yards:5,automaticFirst:true},{side:'defense',name:'Pass interference',yards:10,automaticFirst:true}]);
+  return null;
+}
+function applyFatigueAndInjuries(offTeam,defTeam,off,def,rules,emit,state){
+  const offPlayers=[off.qb,off.fb,...off.wr,...off.ol].filter(Boolean),defPlayers=[...def.db,...def.dl,def.lb].filter(Boolean),participants=[...new Map([...offPlayers,...defPlayers].map(p=>[p.id,p])).values()];
+  const ironman=!!(rules.ironman||rules.personnel?.ironman);
+  for(const p of participants){
+    const offenseWork=offPlayers.some(x=>x.id===p.id),defenseWork=defPlayers.some(x=>x.id===p.id),twoWay=offenseWork&&defenseWork;
+    const stamina=effective(p,'stamina'),base=twoWay&&ironman?randInt(2,4):randInt(1,3),modifier=clamp((70-stamina)/35,-.4,.8);
+    p.fatigue=clamp((p.fatigue||0)+base*(1+modifier),0,100);
+  }
+  if(!rules.injuries.enabled)return null;
+  const weightedRisk=participants.map(p=>{
+    const f=p.fatigue||0,d=effective(p,'durability'),fatigueExtra=Math.max(0,f-(rules.injuries.fatigueThreshold||55))/100;
+    const weight=clamp(1+(70-d)/80+fatigueExtra*2.2,.25,4);
+    return [p,weight];
+  });
+  const avgFatigue=participants.reduce((a,p)=>a+(p.fatigue||0),0)/Math.max(1,participants.length),avgDurability=participants.reduce((a,p)=>a+effective(p,'durability'),0)/Math.max(1,participants.length);
+  const snapRisk=clamp((rules.injuries.perSnapRate||.0015)*(1+Math.max(0,avgFatigue-50)/65+Math.max(0,65-avgDurability)/90),.0002,rules.injuries.maxRate||.008);
+  if(random()>snapRisk)return null;
+  const p=weighted(weightedRisk); if(!p)return null;
+  const fatigueFactor=1+Math.max(0,(p.fatigue||0)-55)/100,durability=effective(p,'durability');
+  const severeChance=clamp(.12+(65-durability)/250+.10*(fatigueFactor-1),.05,.38);
+  p.injuredGames=Math.max(p.injuredGames||0,random()<severeChance?randInt(2,5):1);
+  emit('injury',{playerId:p.id,teamId:p.teamId,position:p.position,games:p.injuredGames,fatigue:Math.round(p.fatigue||0),durability:Math.round(durability)},`Q${state.quarter} ${fmt(state.seconds)} INJURY: ${p.name} (${p.position}) will miss ${p.injuredGames} game${p.injuredGames===1?'':'s'}`);
+  return p;
+}
+function recoverFatigue(teams,rules,amount){
+  for(const team of teams)for(const p of team.roster)p.fatigue=clamp((p.fatigue||0)-amount,0,100);
+}
+function finalMinuteWindow(state,rules){
+  const limit=state.quarter<=2?(rules.clock.firstHalfFinalMinute||60):(rules.clock.secondHalfFinalMinute||60);
+  return !state.overtime&&state.seconds<=limit;
+}
+function gameManagementMode(state,teamId,home){
+  const diff=scoreDiff(state,teamId,home),late=state.quarter>=4&&state.seconds<=180;
+  if(!late)return'normal';
+  if(diff<0)return'hurry';
+  if(diff>0)return'bleed';
+  return state.seconds<=75?'hurry':'normal';
+}
+function timeoutsLeft(state,teamId){return state.timeouts?.[teamId]??0;}
+function consumeTimeout(state,teamId,emit,reason='clock_management'){
+  if(timeoutsLeft(state,teamId)<=0)return false;
+  state.timeouts[teamId]--;
+  emit('timeout',{teamId,remaining:state.timeouts[teamId],reason},`${teamId===state.homeTeamId?'HOME':'AWAY'} timeout — ${state.timeouts[teamId]} remaining`);
+  state.clockRunning=false;return true;
+}
+function playClockRunoff(state,result,rules,offTeam,defTeam,home,emit){
+  const mode=gameManagementMode(state,offTeam.id,home),clockStopsByRule=finalMinuteWindow(state,rules)&&((result?.incomplete&&rules.clock.stopOnIncomplete)||(result?.outOfBounds&&rules.clock.stopOnOutOfBounds));
+  if(clockStopsByRule){state.clockRunning=false;return randInt(5,9);}
+  state.clockRunning=true;
+  if(state.quarter>=4&&state.seconds<=120){
+    const offDiff=scoreDiff(state,offTeam.id,home),defDiff=-offDiff;
+    if(offDiff<0&&result?.complete&&!result?.outOfBounds&&timeoutsLeft(state,offTeam.id)>0&&state.seconds<=75&&random()<.48){consumeTimeout(state,offTeam.id,emit,'preserve_clock');const [a,b]=rules.clock.timeoutClockRunoff||[4,8];return randInt(a,b);}
+    if(defDiff<0&&timeoutsLeft(state,defTeam.id)>0&&state.seconds<=105&&random()<.72){consumeTimeout(state,defTeam.id,emit,'stop_opponent_clock');const [a,b]=rules.clock.timeoutClockRunoff||[4,8];return randInt(a,b);}
+  }
+  const range=mode==='hurry'?(rules.clock.hurryRunoff||[10,20]):mode==='bleed'?(rules.clock.bleedRunoff||[30,42]):(rules.clock.normalRunoff||[22,38]);
+  let [a,b]=range;
+  if(rules.clock.runningClock&&!finalMinuteWindow(state,rules)){a=Math.max(a,18);b=Math.max(b,30);}
+  return randInt(a,b);
+}
+function conversionDecision(state,teamId,home){
+  const diff=scoreDiff(state,teamId,home),late=state.quarter>=4&&state.seconds<=300;
+  if(late && [-2,-5,-8,-11].includes(diff))return 2;
+  return random()<.08?2:1;
+}
+function attemptConversion(offTeam,defTeam,off,def,state,rules,home,emit){
+  const kind=conversionDecision(state,offTeam.id,home);
+  if(kind===1){
+    const good=random()<clamp(.90+(effective(off.k,'skill')-65)*.004,.68,.98);
+    if(good){if(offTeam.id===home.id)state.homeScore+=rules.scoring.xp1;else state.awayScore+=rules.scoring.xp1;}
+    emit('conversion_kick',{teamId:offTeam.id,kickerId:off.k?.id||null,points:good?rules.scoring.xp1:0,good},`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr} 1-point try ${good?'GOOD':'NO GOOD'}`);
+  }else{
+    const play=weighted([['RUN_POWER',2],['SLANT',5],['QUICK_OUT',2],['CROSS',1]]),defCall=defensiveCall({down:1,toGo:3,yardLine:47,quarter:state.quarter,seconds:state.seconds},rules),res=playInfo(play).family==='run'?runSnap(off,def,play,defCall,rules):passSnap(off,def,play,defCall,rules);
+    const good=!res.turnover&&!res.incomplete&&!res.sack&&res.yards>=3;
+    if(good){if(offTeam.id===home.id)state.homeScore+=rules.scoring.xp2;else state.awayScore+=rules.scoring.xp2;}
+    emit('conversion_two_point',{teamId:offTeam.id,points:good?rules.scoring.xp2:0,good,play,defCall},`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr} 2-point try ${good?'GOOD':'NO GOOD'}`);
+  }
+}
+
+function createGameState(home,away,rules,firstReceiverId=null){
+  const receiver=firstReceiverId||away.id;
+  return {
+    homeTeamId:home.id,awayTeamId:away.id,
+    quarter:1,seconds:rules.quarterMinutes*60,
+    offenseId:receiver,defenseId:receiver===home.id?away.id:home.id,
+    down:1,toGo:rules.firstDownDistance,yardLine:rules.touchbackSpot,
+    homeScore:0,awayScore:0,
+    playCount:0,driveId:null,overtime:false,clockRunning:false,
+    firstHalfReceiverId:receiver,secondHalfReceiverId:receiver===home.id?away.id:home.id,
+    timeouts:{[home.id]:rules.clock.timeoutsPerHalf||3,[away.id]:rules.clock.timeoutsPerHalf||3},
+    otPossessions:{[home.id]:0,[away.id]:0}
+  };
+}
+function makeEvent(state,type,data={},text=''){
+  return {
+    id:uid('ev'),type,
+    quarter:state.quarter,clock:state.seconds,
+    offenseId:state.offenseId,defenseId:state.defenseId,
+    down:state.down,distance:state.toGo,yardLine:state.yardLine,
+    text,...data
+  };
+}
+function eventText(event){ return typeof event==='string'?event:(event?.text||event?.type||'Event'); }
+function startDrive(state,teamId,spot){
+  const drive={id:uid('drv'),teamId,startQuarter:state.quarter,startClock:state.seconds,startYardLine:spot,plays:0,yards:0,result:null,endQuarter:null,endClock:null,endYardLine:null};
+  state.driveId=drive.id;
+  return drive;
+}
+function finishDrive(drive,state,result){
+  if(!drive||drive.result)return;
+  drive.result=result||'possession_change';
+  drive.endQuarter=state.quarter;drive.endClock=state.seconds;drive.endYardLine=state.yardLine;
+}
+
+function emptyGamePlayerStats(){return {offSnaps:0,defSnaps:0,stSnaps:0,passAtt:0,passCmp:0,passYds:0,passTD:0,int:0,rushAtt:0,rushYds:0,rushTD:0,rec:0,recYds:0,recTD:0,tackles:0,sacks:0,defInt:0,defTD:0,intRet:0,intRetYds:0,ff:0,fr:0,fumRet:0,fumRetYds:0,kr:0,krYds:0,krTD:0,pr:0,prYds:0,prTD:0,fgm:0,fga:0,xpm:0,xpa:0};}
+function aggregateGameFromEvents(eventLog,home,away){
+  const players={},participants=new Set(), freshTeam=()=>({plays:0,firstDowns:0,totalYds:0,rushAtt:0,rushYds:0,passAtt:0,completions:0,passYds:0,turnovers:0,sacksAllowed:0,sacks:0,penalties:0,penaltyYds:0,kickReturnYds:0,puntReturnYds:0,possessions:0,points:0});
+  const teams={[home.id]:freshTeam(),[away.id]:freshTeam()};
+  const ps=id=>{if(!id)return null;return players[id]??=(emptyGamePlayerStats());},ts=id=>teams[id]||null;
+  for(const e of eventLog||[]){
+    if(e.type==='snap'){for(const id of (e.participantIds||[]))participants.add(id);for(const id of (e.offenseParticipantIds||[])){const p=ps(id);if(p)p.offSnaps++;}for(const id of (e.defenseParticipantIds||[])){const p=ps(id);if(p)p.defSnaps++;}}
+    const offenseId=e.statTeamId||e.offenseId||e.teamId,team=ts(offenseId);
+    if(e.type==='drive_start'){const t=ts(e.offenseId);if(t)t.possessions++;}
+    if(e.points&&ts(e.teamId))ts(e.teamId).points+=Number(e.points)||0;
+    if(e.type==='rush'||(e.type==='penalty_play'&&e.family==='run')){
+      const y=Number(e.yards)||0;if(team){team.plays++;team.rushAtt++;team.rushYds+=y;team.totalYds+=y;}
+      const c=ps(e.carrierId);if(c){c.rushAtt++;c.rushYds+=y;}const tk=ps(e.tacklerId);if(tk)tk.tackles++;
+    }
+    if(e.type==='pass'||(e.type==='penalty_play'&&e.family==='pass')){
+      if(team){team.plays++;team.passAtt++;}
+      const q=ps(e.qbId);if(q)q.passAtt++;
+      if(e.complete){const y=Number(e.yards)||0;if(team){team.completions++;team.passYds+=y;team.totalYds+=y;}if(q){q.passCmp++;q.passYds+=y;}const r=ps(e.receiverId);if(r){r.rec++;r.recYds+=y;}const tk=ps(e.tacklerId);if(tk)tk.tackles++;}
+      if(e.interception){if(team)team.turnovers++;if(q)q.int++;const d=ps(e.defenderId);if(d)d.defInt++;}
+      if(e.sack){if(team)team.sacksAllowed++;const d=ps(e.defenderId);if(d)d.sacks++;const dt=ts(e.defenseId);if(dt)dt.sacks++;}
+    }
+    if(e.type==='kneel'){const t=ts(e.teamId);if(t){t.plays++;t.rushAtt++;t.rushYds+=Number(e.yards)||0;t.totalYds+=Number(e.yards)||0;}const c=ps(e.qbId);if(c){c.rushAtt++;c.rushYds+=Number(e.yards)||0;}}
+    if(e.type==='spike'){const t=ts(e.teamId);if(t){t.plays++;t.passAtt++;}const q=ps(e.qbId);if(q)q.passAtt++;}
+    if(e.type==='first_down'){const t=ts(e.teamId);if(t)t.firstDowns++;}
+    if(e.type==='fumble_lost'){const t=ts(e.teamId);if(t)t.turnovers++;const f=ps(e.forcedById);if(f)f.ff++;const r=ps(e.recoveredById);if(r)r.fr++;}
+    if(e.type==='interception_return'){const r=ps(e.returnerId);if(r){r.intRet++;r.intRetYds+=Number(e.returnYards)||0;if(e.touchdown)r.defTD++;}}
+    if(e.type==='fumble_return'){const r=ps(e.returnerId);if(r){r.fumRet++;r.fumRetYds+=Number(e.returnYards)||0;if(e.touchdown)r.defTD++;}}
+    if(e.type==='touchdown'){
+      if(e.carrierId){const x=ps(e.carrierId);if(x)x.rushTD++;}
+      else if(e.receiverId){const q=ps(e.qbId),r=ps(e.receiverId);if(q)q.passTD++;if(r)r.recTD++;}
+    }
+    if(e.type==='field_goal'||e.type==='drop_field_goal'){const k=ps(e.kickerId);if(k){k.fga++;if(e.good)k.fgm++;}}
+    if(e.type==='conversion_kick'){const k=ps(e.kickerId);if(k){k.xpa++;if(e.good)k.xpm++;}}
+    if(e.type==='kickoff_return'||e.type==='kickoff_rebound_return'){
+      const r=ps(e.returnerId),y=Number(e.returnYards)||0;if(r){r.kr++;r.krYds+=y;if(e.touchdown)r.krTD++;}const t=ts(e.receivingTeamId);if(t)t.kickReturnYds+=y;
+    }
+    if(e.type==='punt_return'||e.type==='punt_rebound'){
+      const r=ps(e.returnerId),y=Number(e.returnYards)||0;if(r){r.pr++;r.prYds+=y;if(e.touchdown)r.prTD++;}const t=ts(e.receivingTeamId);if(t)t.puntReturnYds+=y;
+    }
+    if(e.type==='penalty'||e.type==='penalty_play'||e.type==='halo_violation'){
+      const t=ts(e.teamId);if(t){t.penalties++;t.penaltyYds+=Number(e.yardsPenalty??e.penaltyYards??e.yards)||0;}
+    }
+  }
+  return {players,participants:[...participants],home:teams[home.id],away:teams[away.id]};
+}
+function applyGameStatsToCareer(gameStats,home,away){
+  const lookup=new Map([...home.roster,...away.roster].map(p=>[p.id,p])),participants=new Set(gameStats.participants||[]);
+  for(const id of participants){
+    const p=lookup.get(id);if(p){p.stats??=emptyStats();p.seasonStats??=emptyStats();p.stats.gp=(p.stats.gp||0)+1;p.seasonStats.gp=(p.seasonStats.gp||0)+1;}
+  }
+  for(const [id,gs] of Object.entries(gameStats.players||{})){
+    const p=lookup.get(id);if(!p)continue;p.stats??=emptyStats();p.seasonStats??=emptyStats();
+    for(const [k,v] of Object.entries(gs)){p.stats[k]=(p.stats[k]||0)+v;p.seasonStats[k]=(p.seasonStats[k]||0)+v;}
+  }
+}
+function assertGameReconciliation(gameStats,eventLog,homeScore,awayScore,home,away){
+  const score={[home.id]:0,[away.id]:0},issues=[];
+  for(const e of eventLog||[]){if(e.points&&score[e.teamId]!==undefined)score[e.teamId]+=Number(e.points)||0;}
+  if(score[home.id]!==homeScore)issues.push(`home score events ${score[home.id]} != ${homeScore}`);
+  if(score[away.id]!==awayScore)issues.push(`away score events ${score[away.id]} != ${awayScore}`);
+  for(const side of ['home','away']){
+    const t=gameStats[side];
+    for(const k of ['plays','firstDowns','totalYds','rushAtt','rushYds','passAtt','completions','passYds','turnovers','sacksAllowed','sacks','penalties','penaltyYds','kickReturnYds','puntReturnYds','possessions','points'])if(!Number.isFinite(t[k]))issues.push(`${side}.${k} invalid`);
+    if(t.totalYds!==t.rushYds+t.passYds)issues.push(`${side} total yards do not reconcile`);
+    if(t.completions>t.passAtt)issues.push(`${side} completions exceed attempts`);
+  }
+  const allPlayers=gameStats.players||{},sum=k=>Object.values(allPlayers).reduce((a,p)=>a+(Number(p[k])||0),0);
+  if(sum('passCmp')!==sum('rec'))issues.push(`player completions ${sum('passCmp')} != receptions ${sum('rec')}`);
+  if(sum('passYds')!==sum('recYds'))issues.push(`player pass yards ${sum('passYds')} != receiving yards ${sum('recYds')}`);
+  const starts=(eventLog||[]).filter(e=>e.type==='drive_start').length;
+  if(starts!==gameStats.home.possessions+gameStats.away.possessions)issues.push(`drive starts ${starts} != possessions ${gameStats.home.possessions+gameStats.away.possessions}`);
+  return issues;
+}
+function simulateGame(home,away,inputRules,{maxEvents=900,seed=null,debug=false}={}){
+  const rules=normalizeRules(inputRules);
+  const simulationSeed=(seed??hashSeed(`${home.id}:${away.id}:${Date.now()}`))>>>0;
+  const previousRng=ACTIVE_RNG; ACTIVE_RNG=new SeededRNG(simulationSeed);
+  const preGameInjuries=new Map([...home.roster,...away.roster].map(p=>[p.id,p.injuredGames||0]));
+  const lineups={[home.id]:starters(home,rules),[away.id]:starters(away,rules)};
+  for(const t of [home,away]) for(const p of t.roster){ p.stats??=emptyStats(); p.fatigue=clamp((p.fatigue||0)*.35,0,100); }
+  const refreshLineup=teamId=>{const t=teamId===home.id?home:away;lineups[teamId]=starters(t,rules);return lineups[teamId];};
+  const box={
+    home:{firstDowns:0,totalYds:0,rushYds:0,passYds:0,turnovers:0,sacksAllowed:0,penalties:0,penaltyYds:0,kickReturnYds:0,possessions:0},
+    away:{firstDowns:0,totalYds:0,rushYds:0,passYds:0,turnovers:0,sacksAllowed:0,penalties:0,penaltyYds:0,kickReturnYds:0,possessions:0}
+  };
+  const eventLog=[], events=[], drives=[], diagnostics=[];
+  const firstReceiver=random()<.5?home.id:away.id;
+  const state=createGameState(home,away,rules,firstReceiver);
+  const emit=(type,data={},text='')=>{const ev=makeEvent(state,type,data,text);ev.sequence=eventLog.length+1;ev.id=`ev_${simulationSeed}_${ev.sequence}`;eventLog.push(ev);events.push(eventText(ev));return ev;};
+  emit('game_start',{seed:simulationSeed},'--- START GAME ---');
+  let currentDrive=null;
+  const score=(teamId,pts)=>{if(teamId===home.id)state.homeScore+=pts;else state.awayScore+=pts;};
+  const teams=id=>id===home.id?home:away;
+  const resetPossession=(newOffenseId,spot=null,kick=false,endReason='possession_change')=>{
+    if(currentDrive){finishDrive(currentDrive,state,endReason);emit('drive_end',{driveId:currentDrive.id,teamId:currentDrive.teamId,result:currentDrive.result,plays:currentDrive.plays,yards:currentDrive.yards,endYardLine:currentDrive.endYardLine},`Drive ends: ${currentDrive.result}`);currentDrive=null;}
+    const previousOffenseId=state.offenseId,oldDefense=newOffenseId===home.id?away:home,newOff=teams(newOffenseId);
+    state.offenseId=newOffenseId;state.defenseId=oldDefense.id;state.down=1;state.toGo=rules.firstDownDistance;state.yardLine=spot??rules.touchbackSpot;state.clockRunning=false;
+    refreshLineup(newOff.id);refreshLineup(oldDefense.id);
+    emit('possession_change',{fromTeamId:previousOffenseId,toTeamId:newOffenseId,reason:endReason,spot:state.yardLine},`${newOff.abbr} takes possession`);
+    teamSideBox(newOffenseId,home,box).possessions++;
+    if(kick) kickoff(newOff,oldDefense,lineups[newOff.id],lineups[oldDefense.id],rules,state,emit,box,home);
+    currentDrive=startDrive(state,newOffenseId,state.yardLine);currentDrive.id=`drv_${simulationSeed}_${drives.length+1}`;state.driveId=currentDrive.id;drives.push(currentDrive);
+    emit('drive_start',{driveId:currentDrive.id,startYardLine:state.yardLine},`${newOff.abbr} drive starts at ${state.yardLine}`);
+  };
+  resetPossession(state.firstHalfReceiverId,rules.touchbackSpot,true);
+  let count=0;
+  while(count++<maxEvents){
+    if(!state.overtime && state.quarter>4)break;
+    if(state.seconds<=0){
+      if(!state.overtime){
+        if(state.quarter<4){
+          const entering=state.quarter+1;
+          recoverFatigue([home,away],rules,entering===3?(rules.clock.halftimeRecovery||rules.injuries.recoveryHalftime||16):(rules.clock.quarterBreakRecovery||rules.injuries.recoveryQuarter||6));
+          state.quarter=entering;state.seconds=rules.quarterMinutes*60;state.clockRunning=false;
+          if(state.quarter===3){state.timeouts[home.id]=rules.clock.timeoutsPerHalf||3;state.timeouts[away.id]=rules.clock.timeoutsPerHalf||3;emit('halftime_end',{receivingTeamId:state.secondHalfReceiverId},'--- SECOND HALF ---');resetPossession(state.secondHalfReceiverId,rules.touchbackSpot,true,'end_half');}
+          emit('period_start',{period:state.quarter},`--- Q${state.quarter} ---`);continue;}
+        if(state.homeScore!==state.awayScore || !rules.overtime.enabled)break;
+        state.overtime=true;state.quarter=5;state.seconds=rules.quarterMinutes*60;emit('overtime_start',{},'--- OVERTIME ---');resetPossession(random()<.5?home.id:away.id,rules.touchbackSpot,true,'end_regulation');continue;
+      }else{break;}
+    }
+    const offTeam=teams(state.offenseId), defTeam=teams(state.defenseId);lineups[offTeam.id]=maybeRefreshPersonnel(offTeam,lineups[offTeam.id],rules);lineups[defTeam.id]=maybeRefreshPersonnel(defTeam,lineups[defTeam.id],rules);const off=lineups[offTeam.id],def=lineups[defTeam.id],statBox=teamSideBox(offTeam.id,home,box);recoverNonParticipants(offTeam,off,rules);recoverNonParticipants(defTeam,def,rules);
+    const before={...state};
+    const play=coachDecision(state,offTeam,home,rules);
+    if(play==='KNEEL'){
+      const y=-1;emit('kneel',{teamId:offTeam.id,qbId:off.qb?.id||null,yards:y},`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr}: ${named(off.qb,'QB')} kneels`);
+      state.playCount++;if(currentDrive){currentDrive.plays++;currentDrive.yards+=y;}state.yardLine=clamp(state.yardLine+y,0,rules.fieldLength);state.toGo-=y;state.down=Math.min(rules.downs,state.down+1);
+      const [a,b]=rules.clock.kneelRunoff||[30,40];state.seconds=Math.max(0,state.seconds-randInt(a,b));continue;
+    }
+    if(play==='SPIKE'){
+      emit('spike',{teamId:offTeam.id,qbId:off.qb?.id||null},`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr}: ${named(off.qb,'QB')} spikes the ball`);
+      state.playCount++;if(currentDrive)currentDrive.plays++;state.down=Math.min(rules.downs,state.down+1);state.clockRunning=false;const [a,b]=rules.clock.spikeRunoff||[2,4];state.seconds=Math.max(0,state.seconds-randInt(a,b));continue;
+    }
+    if(play==='PUNT'){
+      const spot=punt(offTeam,defTeam,off,def,rules,state,emit);state.seconds=Math.max(0,state.seconds-randInt(8,16));if(state.overtime)state.otPossessions[offTeam.id]++;resetPossession(defTeam.id,spot,false,'punt');continue;
+    }
+    if(play==='TURNOVER'){
+      emit('turnover_on_downs',{teamId:offTeam.id},`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr} declines a kick and turns it over on downs`);
+      state.seconds=Math.max(0,state.seconds-randInt(16,24)); const newSpot=clamp(rules.fieldLength-state.yardLine,rules.touchbackSpot,rules.fieldLength-rules.touchbackSpot);resetPossession(defTeam.id,newSpot,false,'turnover_on_downs');continue;
+    }
+    if(play==='FG'||play==='DROP_FG'){
+      const drop=play==='DROP_FG',distance=(rules.fieldLength-state.yardLine)+8,good=random()<fieldGoalChance(off.k,distance,drop),points=drop?(rules.scoring.dropFg||4):rules.scoring.fg;
+      if(good){
+        score(offTeam.id,points);
+        emit(drop?'drop_field_goal':'field_goal',{teamId:offTeam.id,kickerId:off.k?.id||null,distance,good:true,points},`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr} ${drop?'DROP-KICK ':''}FIELD GOAL GOOD (${distance} yd)`);
+        state.seconds=Math.max(0,state.seconds-randInt(18,28));if(state.overtime)state.otPossessions[offTeam.id]++;
+        resetPossession(defTeam.id,rules.touchbackSpot,true,'field_goal');continue;
+      }
+      emit(drop?'drop_field_goal':'field_goal',{teamId:offTeam.id,kickerId:off.k?.id||null,distance,good:false,points:0},`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr} ${drop?'drop-kick ':''}field goal MISSED (${distance} yd)`);
+      state.seconds=Math.max(0,state.seconds-randInt(18,28));if(state.overtime)state.otPossessions[offTeam.id]++;
+      if(rules.reboundNets&&random()<.60){
+        const reboundSpot=clamp(rules.fieldLength-randInt(2,10),1,rules.fieldLength-1),returner=def.returner||def.wr?.[0]||def.fb,retYds=clamp(randInt(0,10)+Math.round((effective(returner,'speed')-65)/9),0,16),spot=clamp(rules.fieldLength-reboundSpot+retYds,rules.touchbackSpot,rules.fieldLength-1);
+        emit('missed_kick_rebound',{kickingTeamId:offTeam.id,receivingTeamId:defTeam.id,reboundSpot,returnerId:returner?.id||null,returnYards:retYds,spot},`Missed kick hits the rebound net; ${named(returner,'Returner')} recovers and returns ${retYds} yards`);
+        resetPossession(defTeam.id,spot,false,'missed_kick_rebound');continue;
+      }
+      const rougeRule=rules.kicking?.rouge;
+      if(rougeRule?.enabled&&['kick_dead_end_zone','missed_kick_dead_end_zone'].includes(rougeRule.trigger||'kick_dead_end_zone')&&random()<.35){
+        const pts=rougeRule.points||1;score(offTeam.id,pts);
+        emit('rouge',{teamId:offTeam.id,receivingTeamId:defTeam.id,kickerId:off.k?.id||null,points:pts,spot:rougeRule.spot??rules.touchbackSpot},`${offTeam.abbr} scores a ROUGE on the missed kick`);
+        resetPossession(defTeam.id,rougeRule.spot??rules.touchbackSpot,false,'rouge');continue;
+      }
+      resetPossession(defTeam.id,rules.touchbackSpot,false,'missed_field_goal');continue;
+    }
+    const pen=maybePenalty(offTeam,defTeam,rules);
+    if(pen?.noPlay){
+      statBox.penalties++;statBox.penaltyYds+=pen.yards;state.yardLine=clamp(state.yardLine-pen.yards,0,rules.fieldLength-1);state.toGo=Math.min(rules.fieldLength-state.yardLine,state.toGo+pen.yards);state.seconds=Math.max(0,state.seconds-randInt(4,8));emit('penalty',{teamId:offTeam.id,name:pen.name,yards:pen.yards,penaltyYards:pen.yards,side:pen.side,noPlay:true},`Q${state.quarter} ${fmt(before.seconds)} ${offTeam.abbr}: ${pen.name}, ${pen.yards} yards (no play)`);continue;
+    }
+    const defCall=defensiveCall(state,rules);
+    const prePen=preSnapPenalty(off,def,rules,play,defCall);
+    if(prePen){const targetTeam=prePen.side==='offense'?offTeam:defTeam;emit('penalty',{teamId:targetTeam.id,name:prePen.name,yards:prePen.yards,penaltyYards:prePen.yards,side:prePen.side,noPlay:true},`Q${state.quarter} ${fmt(state.seconds)} ${prePen.name}, ${prePen.yards} yards (no play)`);if(prePen.side==='offense'){state.yardLine=clamp(state.yardLine-prePen.yards,0,rules.fieldLength-1);state.toGo=Math.min(rules.fieldLength-state.yardLine,state.toGo+prePen.yards);}else{state.yardLine=clamp(state.yardLine+prePen.yards,0,rules.fieldLength-1);if(prePen.automaticFirst){state.down=1;state.toGo=Math.min(rules.firstDownDistance,rules.fieldLength-state.yardLine);}}state.seconds=Math.max(0,state.seconds-randInt(4,8));continue;}
+    emit('snap',{teamId:offTeam.id,play,defCall,qbId:off.qb?.id||null,motionPlayerId:(playInfo(play).motionPlayers||0)>0?off.motionReceiver?.id||null:null,offenseParticipantIds:offenseParticipants(off).map(p=>p.id),defenseParticipantIds:defenseParticipants(def).map(p=>p.id),participantIds:[...new Set([...lineupParticipants(off),...lineupParticipants(def)].map(p=>p.id))]},`Snap: ${offTeam.abbr} ${playInfo(play).label} vs ${DEFENSE_CALLS[defCall].label}`);
+    const result=playInfo(play).family==='run'?runSnap(off,def,play,defCall,rules):passSnap(off,def,play,defCall,rules);
+    let gained=result.yards;
+    if(pen){
+      const penBox=pen.side==='offense'?statBox:teamSideBox(defTeam.id,home,box);penBox.penalties++;penBox.penaltyYds+=pen.yards;
+      if(pen.side==='offense'){gained-=pen.yards;emit('penalty_play',{teamId:offTeam.id,statTeamId:offTeam.id,name:pen.name,penaltyYards:pen.yards,yards:gained,rawYards:result.yards,side:pen.side,play,family:playInfo(play).family,result:result.type,complete:!!result.complete,sack:!!result.sack,interception:!!result.interception,fumble:!!result.fumble,qbId:result.qb?.id||off.qb?.id||null,receiverId:result.receiver?.id||null,carrierId:result.carrier?.id||null,tacklerId:result.tackler?.id||null,defenderId:result.defender?.id||null},`Q${state.quarter} ${fmt(before.seconds)} ${offTeam.abbr}: ${result.desc}; ${pen.name} -${pen.yards}`);}
+      else{gained=Math.max(gained,pen.yards);emit('penalty_play',{teamId:defTeam.id,statTeamId:offTeam.id,offenseId:offTeam.id,name:pen.name,penaltyYards:pen.yards,yards:gained,rawYards:result.yards,side:pen.side,play,family:playInfo(play).family,result:result.type,complete:!!result.complete,sack:!!result.sack,interception:!!result.interception,fumble:!!result.fumble,qbId:result.qb?.id||off.qb?.id||null,receiverId:result.receiver?.id||null,carrierId:result.carrier?.id||null,tacklerId:result.tackler?.id||null,defenderId:result.defender?.id||null},`Q${state.quarter} ${fmt(before.seconds)} ${offTeam.abbr}: ${result.desc}; ${pen.name} +${pen.yards}`);}
+    }else {emit(result.type==='run'?'rush':'pass',{teamId:offTeam.id,play,defCall,yards:result.yards,complete:!!result.complete,sack:!!result.sack,interception:!!result.interception,fumble:!!result.fumble,qbId:result.qb?.id||null,receiverId:result.receiver?.id||null,carrierId:result.carrier?.id||null,tacklerId:result.tackler?.id||null,defenderId:result.defender?.id||null,blockerId:result.blocker?.id||null,airYards:result.airYards??null,yac:result.yac??null,wallContact:!!result.wallContact},`Q${before.quarter} ${fmt(before.seconds)} ${offTeam.abbr} ${before.down}&${before.toGo} @${before.yardLine}: ${result.desc}`);
+      if(result.wallContact)emit('wall_contact',{teamId:offTeam.id,playerId:result.receiver?.id||result.carrier?.id||null,spot:clamp(before.yardLine+result.yards,0,rules.fieldLength)},`${named(result.receiver||result.carrier,'Ball carrier')} contacts the live wall`);
+    }
+    statBox.totalYds+=gained;
+    state.playCount++;
+    if(currentDrive){currentDrive.plays++;currentDrive.yards+=gained;}
+    if(debug)diagnostics.push({playNumber:state.playCount,driveId:state.driveId,quarter:before.quarter,clock:before.seconds,down:before.down,distance:before.toGo,yardLine:before.yardLine,offenseId:offTeam.id,defenseId:defTeam.id,play,defCall,result:{type:result.type,yards:result.yards,complete:!!result.complete,sack:!!result.sack,interception:!!result.interception,fumble:!!result.fumble,pressured:!!result.pressured}});
+    if(result.interception){
+      statBox.turnovers++;const interceptSpot=clamp(before.yardLine+randInt(0,Math.max(1,Math.min(8,rules.fieldLength-before.yardLine-1))),1,rules.fieldLength-1),returner=result.defender||best(def.db,'coverage'),returnYards=clamp(randInt(0,10)+Math.round((effective(returner,'speed')-65)/8),0,18),baseSpot=rules.fieldLength-interceptSpot,newSpot=clamp(baseSpot+returnYards,rules.touchbackSpot,rules.fieldLength);
+      const td=newSpot>=rules.fieldLength;emit('interception_return',{teamId:defTeam.id,returnerId:returner?.id||null,interceptSpot,returnYards,spot:newSpot,touchdown:td},`${named(returner,'Defender')} returns the interception ${returnYards} yards${td?' for a TOUCHDOWN':''}`);
+      state.seconds=Math.max(0,state.seconds-playClockRunoff(state,result,rules,offTeam,defTeam,home,emit));
+      if(td){score(defTeam.id,rules.scoring.td);emit('touchdown',{teamId:defTeam.id,points:rules.scoring.td,returnerId:returner?.id||null,defensive:true},`${defTeam.abbr} defensive TOUCHDOWN`);attemptConversion(defTeam,offTeam,refreshLineup(defTeam.id),refreshLineup(offTeam.id),state,rules,home,emit);resetPossession(offTeam.id,rules.touchbackSpot,true,'interception_touchdown');}
+      else resetPossession(defTeam.id,newSpot,false,'interception');
+      if(state.overtime)state.otPossessions[offTeam.id]++;continue;}
+    state.yardLine=clamp(state.yardLine+gained,0,rules.fieldLength);state.toGo-=gained;
+    if(result.fumble){
+      const lost=random()<.48;
+      if(lost){
+        statBox.turnovers++;const forcedBy=result.tackler||best([...(def.db||[]),...(def.dl||[]),def.lb].filter(Boolean),'tackle'),recoveredBy=best([...(def.db||[]),...(def.dl||[]),def.lb].filter(Boolean),'awareness');emit('fumble_lost',{teamId:offTeam.id,recoveringTeamId:defTeam.id,forcedById:forcedBy?.id||null,recoveredById:recoveredBy?.id||null},`Q${state.quarter} ${fmt(state.seconds)} FUMBLE recovered by ${defTeam.abbr}`);
+        const baseSpot=rules.fieldLength-state.yardLine,returnYards=clamp(randInt(0,7)+Math.round((effective(recoveredBy,'speed')-65)/10),0,14),newSpot=clamp(baseSpot+returnYards,rules.touchbackSpot,rules.fieldLength),td=newSpot>=rules.fieldLength;emit('fumble_return',{teamId:defTeam.id,returnerId:recoveredBy?.id||null,returnYards,spot:newSpot,touchdown:td},`${named(recoveredBy,'Defender')} returns the fumble ${returnYards} yards${td?' for a TOUCHDOWN':''}`);
+        state.seconds=Math.max(0,state.seconds-randInt(10,22));if(state.overtime)state.otPossessions[offTeam.id]++;
+        if(td){score(defTeam.id,rules.scoring.td);emit('touchdown',{teamId:defTeam.id,points:rules.scoring.td,returnerId:recoveredBy?.id||null,defensive:true},`${defTeam.abbr} defensive TOUCHDOWN`);attemptConversion(defTeam,offTeam,refreshLineup(defTeam.id),refreshLineup(offTeam.id),state,rules,home,emit);resetPossession(offTeam.id,rules.touchbackSpot,true,'fumble_touchdown');}
+        else resetPossession(defTeam.id,newSpot,false,'fumble_lost');continue;}
+      emit('fumble_recovered',{teamId:offTeam.id},`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr} fumbles but recovers`);
+    }
+    if(state.yardLine<=0){
+      score(defTeam.id,rules.scoring.safety);emit('safety',{teamId:defTeam.id,points:rules.scoring.safety},`Q${state.quarter} ${fmt(state.seconds)} SAFETY for ${defTeam.abbr}`);state.seconds=Math.max(0,state.seconds-randInt(15,25));if(state.overtime)state.otPossessions[offTeam.id]++;resetPossession(defTeam.id,rules.touchbackSpot,true,'safety');continue;
+    }
+    if(state.yardLine>=rules.fieldLength){
+      score(offTeam.id,rules.scoring.td);
+      emit('touchdown',{teamId:offTeam.id,points:rules.scoring.td,play,carrierId:result.carrier?.id||null,receiverId:result.receiver?.id||null,qbId:off.qb?.id||null},`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr} TOUCHDOWN — ${result.desc}`);attemptConversion(offTeam,defTeam,off,def,state,rules,home,emit);state.seconds=Math.max(0,state.seconds-randInt(8,18));if(state.overtime)state.otPossessions[offTeam.id]++;
+      if(state.overtime){
+        const both=state.otPossessions[home.id]>=rules.overtime.possessionsEach&&state.otPossessions[away.id]>=rules.overtime.possessionsEach;
+        if(both&&state.homeScore!==state.awayScore)break;
+      }
+      resetPossession(defTeam.id,rules.touchbackSpot,true,'touchdown');continue;
+    }
+    if(pen?.automaticFirst || state.toGo<=0){state.down=1;state.toGo=Math.min(rules.firstDownDistance,rules.fieldLength-state.yardLine);statBox.firstDowns++;emit('first_down',{teamId:offTeam.id,spot:state.yardLine},`${offTeam.abbr} first down at ${state.yardLine}`);}
+    else{const nextDown=state.down+1;if(nextDown>rules.downs){emit('turnover_on_downs',{teamId:offTeam.id},`Q${state.quarter} ${fmt(state.seconds)} ${offTeam.abbr}: turnover on downs`);state.seconds=Math.max(0,state.seconds-randInt(12,22));const newSpot=clamp(rules.fieldLength-state.yardLine,rules.touchbackSpot,rules.fieldLength-rules.touchbackSpot);if(state.overtime)state.otPossessions[offTeam.id]++;resetPossession(defTeam.id,newSpot,false,'turnover_on_downs');continue;}state.down=nextDown;}
+    const injured=applyFatigueAndInjuries(offTeam,defTeam,off,def,rules,emit,state);
+    if(injured){refreshLineup(injured.teamId);emit('substitution',{teamId:injured.teamId,reason:'injury',injuredPlayerId:injured.id},`${teams(injured.teamId).abbr} adjusts its lineup after the injury`);}
+    state.seconds=Math.max(0,state.seconds-playClockRunoff(state,result,rules,offTeam,defTeam,home,emit));
+    if(state.overtime){
+      const both=state.otPossessions[home.id]>=rules.overtime.possessionsEach&&state.otPossessions[away.id]>=rules.overtime.possessionsEach;
+      if(both&&state.homeScore!==state.awayScore)break;
+    }
+  }
+  if(state.homeScore===state.awayScore && rules.overtime.enabled){
+    let guard=0;while(state.homeScore===state.awayScore&&guard++<3){const winnerId=random()<.5?home.id:away.id;score(winnerId,rules.scoring.fg);emit('overtime_decider',{teamId:winnerId,points:rules.scoring.fg},`OT sudden-death field goal decides the game`);}
+  }
+  if(currentDrive){finishDrive(currentDrive,state,'end_game');emit('drive_end',{driveId:currentDrive.id,teamId:currentDrive.teamId,result:currentDrive.result,plays:currentDrive.plays,yards:currentDrive.yards,endYardLine:currentDrive.endYardLine},`Drive ends: ${currentDrive.result}`);}
+  emit('game_end',{homeScore:state.homeScore,awayScore:state.awayScore},`--- FINAL: ${away.abbr} ${state.awayScore}, ${home.abbr} ${state.homeScore} ---`);
+  const gameStats=aggregateGameFromEvents(eventLog,home,away);
+  applyGameStatsToCareer(gameStats,home,away);
+  const reconciliationIssues=assertGameReconciliation(gameStats,eventLog,state.homeScore,state.awayScore,home,away);
+  if(debug&&reconciliationIssues.length)diagnostics.push({type:'reconciliation',issues:reconciliationIssues});
+  for(const p of [...home.roster,...away.roster])if((preGameInjuries.get(p.id)||0)>0)p.injuredGames=Math.max(0,(p.injuredGames||0)-1);
+  ACTIVE_RNG=previousRng;
+  return {homeScore:state.homeScore,awayScore:state.awayScore,events,eventLog,drives,gameStats:{players:gameStats.players},boxScore:{home:gameStats.home,away:gameStats.away},seed:simulationSeed,diagnostics:debug?diagnostics:undefined,reconciliationIssues,engineVersion:'1.4'};
+}
+
+function runSimulationSelfTests(sampleSize=200){
+  const report={sampleSize,failures:[],metrics:{games:0,totalPoints:0,totalPlays:0,totalPossessions:0,totalTurnovers:0,totalPenalties:0,reboundEvents:0,punts:0,rouges:0,deuces:0,injuries:0}};
+  const makeTeams=()=>{
+    const u=createUniverse('test'),l=createLeague(u,{name:'Test',teamCount:2,rules:DEFAULT_RULES});
+    return {home:l.teams[0],away:l.teams[1],rules:normalizeRules(l.rules)};
+  };
+  const baseline=makeTeams(),h1=deepClone(baseline.home),a1=deepClone(baseline.away),h2=deepClone(baseline.home),a2=deepClone(baseline.away);
+  const r1=simulateGame(h1,a1,baseline.rules,{seed:424242,debug:true}),r2=simulateGame(h2,a2,baseline.rules,{seed:424242,debug:true});
+  if(JSON.stringify(r1.eventLog)!==JSON.stringify(r2.eventLog))report.failures.push('seeded replay mismatch');
+  for(let i=0;i<sampleSize;i++){
+    const {home,away,rules}=makeTeams(),res=simulateGame(home,away,rules,{seed:100000+i,debug:true});
+    report.metrics.games++;report.metrics.totalPoints+=res.homeScore+res.awayScore;report.metrics.totalPlays+=res.boxScore.home.plays+res.boxScore.away.plays;report.metrics.totalPossessions+=res.boxScore.home.possessions+res.boxScore.away.possessions;report.metrics.totalTurnovers+=res.boxScore.home.turnovers+res.boxScore.away.turnovers;report.metrics.totalPenalties+=res.boxScore.home.penalties+res.boxScore.away.penalties;
+    for(const e of res.eventLog||[]){
+      if(e.clock<0)report.failures.push(`negative clock game ${i}`);
+      if(e.yardLine<0||e.yardLine>rules.fieldLength)report.failures.push(`field position game ${i}`);
+      if(e.down<1||e.down>rules.downs)report.failures.push(`down state game ${i}`);
+      if(e.type==='rebound_net'||e.type==='missed_kick_rebound'||e.type==='punt_rebound')report.metrics.reboundEvents++;
+      if(e.type==='punt')report.metrics.punts++;
+      if(e.type==='rouge')report.metrics.rouges++;
+      if(e.type==='deuce')report.metrics.deuces++;
+      if(e.type==='injury')report.metrics.injuries++;
+    }
+    if(res.reconciliationIssues?.length)report.failures.push(...res.reconciliationIssues.map(x=>`game ${i}: ${x}`));
+    if(rules.punting===false&&(res.eventLog||[]).some(e=>e.type==='punt'))report.failures.push(`punt in no-punt game ${i}`);
+    if(rules.reboundNets===false&&(res.eventLog||[]).some(e=>String(e.type).includes('rebound')))report.failures.push(`rebound with nets disabled game ${i}`);
+    const li=starters(home,rules),lineupIssues=validateLineup(home,li,rules);if(lineupIssues.length)report.failures.push(`lineup game ${i}: ${lineupIssues.join(',')}`);
+  }
+  {
+    const {home,away}=makeTeams(),noNet=normalizeRules(deepClone(DEFAULT_RULES));noNet.kicking.reboundNets=false;noNet.reboundNets=false;noNet.kicking.deuce.enabled=false;noNet.deuce=false;noNet.kicking.rouge.enabled=false;noNet.rouge=false;
+    const res=simulateGame(home,away,noNet,{seed:99101});
+    if((res.eventLog||[]).some(e=>String(e.type).includes('rebound')))report.failures.push('rebound event with nets disabled variant');
+  }
+  {
+    let puntCount=0;
+    for(let i=0;i<24;i++){
+      const {home,away}=makeTeams(),puntRules=normalizeRules(deepClone(DEFAULT_RULES));puntRules.kicking.punting=true;puntRules.punting=true;
+      const res=simulateGame(home,away,puntRules,{seed:99200+i});puntCount+=(res.eventLog||[]).filter(e=>e.type==='punt').length;
+    }
+    if(puntCount===0)report.failures.push('punt-enabled rules never produced a punt');
+  }
+  {
+    const {home,away}=makeTeams(),motionRules=normalizeRules(deepClone(DEFAULT_RULES));motionRules.personnel.motionPlayers=0;motionRules.motion.offensivePlayers=0;motionRules.highMotion=false;motionRules.personnel.highMotion=false;
+    const res=simulateGame(home,away,motionRules,{seed:99301});
+    if((res.eventLog||[]).some(e=>e.type==='penalty'&&e.name==='Illegal motion'))report.failures.push('illegal motion generated when motion disabled');
+  }
+  const g=Math.max(1,report.metrics.games);
+  report.averages={points:report.metrics.totalPoints/g,plays:report.metrics.totalPlays/g,possessions:report.metrics.totalPossessions/g,turnovers:report.metrics.totalTurnovers/g,penalties:report.metrics.totalPenalties/g};
+  report.ok=report.failures.length===0;
+  return report;
+}
+
+function runLeagueLifecycleSelfTest(){
+  const failures=[];
+  const u=createUniverse('league-test'),l=createLeague(u,{name:'League Test',teamCount:5,rules:DEFAULT_RULES,scheduleConfig:{rounds:2},playoffConfig:{enabled:true,teams:4,reseed:true}});
+  const rg=regularGames(l);
+  if(rg.length!==20)failures.push(`5-team double round robin expected 20 games, got ${rg.length}`);
+  const byWeek=new Map();
+  for(const g of rg){const arr=byWeek.get(g.week)||[];arr.push(g);byWeek.set(g.week,arr);}
+  for(const [week,games] of byWeek){
+    const seen=new Set();for(const g of games)for(const id of [g.homeId,g.awayId]){if(seen.has(id))failures.push(`team scheduled twice in week ${week}`);seen.add(id);}
+  }
+  for(const g of rg){
+    const H=l.teams.find(t=>t.id===g.homeId),A=l.teams.find(t=>t.id===g.awayId),res=simulateGame(H,A,l.rules,{seed:g.seed});
+    recordResult(l,g,res);
+  }
+  const table=standings(l);
+  if(table.some(t=>t.gamesPlayed!==8))failures.push('regular-season game counts incorrect for 5-team double round robin');
+  advanceSeason(l);
+  if(!['playoffs','championship'].includes(l.phase))failures.push(`playoffs did not initialize: ${l.phase}`);
+  let guard=0,g;
+  while((g=l.schedule.find(x=>x.stage==='playoff'&&!x.played))&&guard++<20){
+    const H=l.teams.find(t=>t.id===g.homeId),A=l.teams.find(t=>t.id===g.awayId),res=simulateGame(H,A,l.rules,{seed:g.seed});
+    recordResult(l,g,res);
+  }
+  ensurePlayoffProgress(l);
+  if(l.phase!=='offseason'||!l.playoffState?.championTeamId)failures.push('playoff bracket did not produce champion');
+  const oldSeason=l.season,championId=l.playoffState?.championTeamId;
+  advanceSeason(l);
+  if(l.season!==oldSeason+1||l.phase!=='regularSeason')failures.push('new season did not initialize');
+  if(l.completedSeasons.length!==1)failures.push('season archive missing');
+  const archive=l.completedSeasons[0];
+  if(archive?.championTeamId!==championId)failures.push('archived champion mismatch');
+  if(!archive?.playerSeasons?.length||!archive?.teamSeasons?.length||!archive?.games?.length)failures.push('historical season snapshot incomplete');
+  if(!l.records?.game?.teamPoints||!l.records?.season?.teamWins)failures.push('league records were not updated');
+  if(l.teams.some(t=>t.roster.some(p=>(p.seasonStats?.gp||0)!==0)))failures.push('season stats not reset');
+  const archived=l.completedSeasons.at(-1);if(!archived?.awards?.length)failures.push('season awards were not archived');if(!archived?.teamSeasons?.every(t=>t.stats))failures.push('team season stats were not archived');
+  return {ok:failures.length===0,failures,regularGames:rg.length,playoffGames:archive?.games?.filter(g=>g.stage==='playoff').length||0,championTeamId:championId};
+}
+
+function runRulesVariantSelfTest(){
+  const failures=[],u=createUniverse('rules-test'),summaries=[];
+  for(const cfg of [
+    {players:6,length:45,ironman:false,punting:true,nets:false},
+    {players:7,length:50,ironman:false,punting:false,nets:false},
+    {players:8,length:50,ironman:true,punting:false,nets:true}
+  ]){
+    const rules=deepClone(DEFAULT_RULES);rules.playersOnField=cfg.players;rules.fieldLength=cfg.length;rules.ironman=cfg.ironman;rules.punting=cfg.punting;rules.reboundNets=cfg.nets;
+    rules.personnel.playersPerSide=cfg.players;rules.personnel.ironman=cfg.ironman;rules.personnel.substitutionMode=cfg.ironman?'ironman':'free';delete rules.personnel.offenseSlots;delete rules.personnel.defenseSlots;
+    rules.field.length=cfg.length;rules.kicking.punting=cfg.punting;rules.kicking.reboundNets=cfg.nets;
+    const l=createLeague(u,{name:`${cfg.players}-man`,teamCount:2,rules,playoffConfig:{enabled:false,teams:0}});
+    const normalized=normalizeRules(l.rules),o=normalized.personnel.offenseSlots,d=normalized.personnel.defenseSlots;
+    const os=(o.QB||0)+(o.FB||0)+(o.WR||0)+(o.OL||0),ds=(d.DL||0)+(d.LB||0)+(d.DB||0);
+    if(os!==cfg.players)failures.push(`${cfg.players}-man offense slots ${os}`);
+    if(ds!==cfg.players)failures.push(`${cfg.players}-man defense slots ${ds}`);
+    for(const t of l.teams){const issues=validateLineup(t,starters(t,normalized),normalized);if(issues.length)failures.push(`${cfg.players}-man lineup: ${issues.join(',')}`);}
+    const g=l.schedule[0],H=l.teams.find(t=>t.id===g.homeId),A=l.teams.find(t=>t.id===g.awayId),res=simulateGame(H,A,normalized,{seed:70000+cfg.players});
+    if((res.eventLog||[]).some(e=>e.yardLine<0||e.yardLine>cfg.length))failures.push(`${cfg.players}-man field coordinates invalid`);
+    if(!cfg.punting&&(res.eventLog||[]).some(e=>e.type==='punt'))failures.push(`${cfg.players}-man no-punt rules produced punt`);
+    if(!cfg.nets&&(res.eventLog||[]).some(e=>String(e.type).includes('rebound')))failures.push(`${cfg.players}-man no-net rules produced rebound`);
+    summaries.push({players:cfg.players,fieldLength:cfg.length,score:[res.awayScore,res.homeScore],events:res.eventLog.length});
+  }
+  if(u.leagues.length!==3)failures.push('multi-league universe did not retain all leagues');
+  if(new Set(u.leagues.map(l=>l.rules.playersOnField)).size!==3)failures.push('league-specific rules were not independent');
+  const roundTrip=migrateUniverse(JSON.parse(JSON.stringify(u)));
+  if(roundTrip.leagues.length!==3||roundTrip.leagues.some((l,i)=>l.id!==u.leagues[i].id))failures.push('multi-league save round trip lost identities');
+  return {ok:failures.length===0,failures,summaries};
+}
+function runCareerWorldSelfTest(){
+  const failures=[],u=createUniverse('Career Test'),l=createLeague(u,{name:'Career League',teamCount:4});
+  const beforeIds=new Set(l.teams.flatMap(t=>t.roster.map(p=>p.id))),beforeTx=l.transactions.length;
+  ACTIVE_RNG=new SeededRNG(93731);
+  try{processOffseasonPlayerWorld(l);}finally{ACTIVE_RNG=null;}
+  for(const t of l.teams){const issues=validateLineup(t,starters(t,l.rules),l.rules);if(issues.length)failures.push(`${t.abbr} illegal post-offseason lineup: ${issues.join(', ')}`);for(const p of t.roster){if(p.teamId!==t.id)failures.push(`${p.name} teamId mismatch`);if(!Number.isFinite(p.potential)||!Number.isFinite(p.ratings.overall))failures.push(`${p.name} invalid career ratings`);}}
+  const rosterIds=l.teams.flatMap(t=>t.roster.map(p=>p.id)),unique=new Set(rosterIds);if(unique.size!==rosterIds.length)failures.push('player duplicated across team rosters');
+  if(!(l.freeAgents||[]).length)failures.push('free-agent pool empty');if(l.transactions.length<=beforeTx)failures.push('offseason generated no transaction activity');if(validateSchedule(l.teams,l.schedule).length)failures.push('schedule invalid after career processing');
+  const movedOrNew=rosterIds.some(id=>!beforeIds.has(id));if(!movedOrNew&&!(l.retiredPlayers||[]).length)failures.push('career world produced no roster turnover in deterministic test');
+  return {ok:failures.length===0,failures,freeAgents:l.freeAgents.length,retired:l.retiredPlayers.length,transactions:l.transactions.length};
+}
+const fmt=s=>`${Math.floor(s/60)}:${String(Math.max(0,s%60)).padStart(2,'0')}`;
+
+const SAVE_SCHEMA_VERSION=11;
+function migrateUniverse(u){
+  if(!u||!Array.isArray(u.leagues))return u;
+  u.version=u.version||1;
+  for(const l of u.leagues){
+    l.rules=normalizeRules(l.rules);l.phase??='regularSeason';l.pendingRules??=null;l.freeAgents??=[];l.retiredPlayers??=[];l.transactions??=[];l.scheduleConfig??={format:'round_robin',rounds:2};l.playoffConfig??={enabled:true,teams:Math.min(4,(l.teams||[]).length),reseed:true};l.playoffState??=null;l.records??={game:{},season:{},career:{}};l.records.career??={};l.history??=[];l.completedSeasons??=[];for(const y of l.completedSeasons){y.awards??=[];}
+    for(const t of (l.teams||[])){t.franchiseId??=t.id;t.history??=[];t.depthChart??=null;for(const p of (t.roster||[])){p.experience??=Math.max(0,(p.age||21)-21);p.secondaryPositions??=[];p.rosterStatus??='active';p.careerStatus??=(p.rosterStatus==='retired'?'retired':'active');p.stats??=emptyStats();p.seasonStats??=emptyStats();p.history??=[];p.awards??=[];p.ratings??={};p.potential??=clamp((p.ratings.overall??60)+8,30,95);p.archetype??='Balanced';const base=p.ratings.overall??60;for(const k of ['speed','acceleration','agility','strength','stamina','durability','awareness','passShort','passMedium','passDeep','armStrength','decision','scramble','catching','routeRunning','release','contestedCatch','ballSecurity','vision','elusiveness','power','breakTackle','passBlock','runBlock','blockStrength','manCoverage','zoneCoverage','tackling','passRush','blockShedding','pursuit','kickPower','kickAccuracy','kickoff','dropKick','twoWay','wallAwareness','motion'])p.ratings[k]??=p.ratings.skill??base;fillPlayerBio(p);recalculateOverall(p);}}
+    for(const p of [...(l.freeAgents||[]),...(l.retiredPlayers||[])]){p.teamId??=null;p.stats??=emptyStats();p.seasonStats??=emptyStats();p.history??=[];p.awards??=[];p.ratings??={overall:55};p.potential??=clamp((p.ratings.overall||55)+8,30,95);p.archetype??='Balanced';p.careerStatus??=(p.rosterStatus==='retired'?'retired':'active');fillPlayerBio(p);for(const k of ['speed','acceleration','agility','strength','stamina','durability','awareness','passShort','passMedium','passDeep','armStrength','decision','scramble','catching','routeRunning','release','contestedCatch','ballSecurity','vision','elusiveness','power','breakTackle','passBlock','runBlock','blockStrength','manCoverage','zoneCoverage','tackling','passRush','blockShedding','pursuit','kickPower','kickAccuracy','kickoff','dropKick','twoWay','wallAwareness','motion'])p.ratings[k]??=p.ratings.overall||55;recalculateOverall(p);}
+    seedFreeAgents(l,Math.max(12,(l.teams||[]).length*4));
+    for(const g of (l.schedule||[])){
+      g.seed??=hashSeed(`${g.season||l.season}:${g.id}:${g.homeId}:${g.awayId}`);g.stage??='regular';
+      g.eventLog??=null;g.drives??=null;g.gameStats??=null;g.engineVersion??=null;
+    }
+    recalculateTeamRecords(l);
+  }
+  u.version=SAVE_SCHEMA_VERSION;
+  return u;
+}
+
+const KEY='arenaFootballGM_universe_v1';
+let storageAvailable=false;
+function getStorage(){
+  try {
+    const test='__afgm_test__';
+    window.localStorage.setItem(test,'1');
+    window.localStorage.removeItem(test);
+    storageAvailable=true;
+    return window.localStorage;
+  } catch(e) {
+    storageAvailable=false;
+    return null;
+  }
+}
+function saveUniverse(u){
+  const store=getStorage();
+  if(store){ try{ store.setItem(KEY,JSON.stringify(u)); return true; }catch(e){} }
+  return false;
+}
+function loadUniverse(){
+  const store=getStorage();
+  if(!store) return null;
+  try { const raw=store.getItem(KEY); return raw?migrateUniverse(JSON.parse(raw)):null; } catch(e){ return null; }
+}
+function clearSave(){
+  const store=getStorage();
+  if(store){ try{store.removeItem(KEY);}catch(e){} }
+}
+function exportSave(){ return JSON.stringify(universe); }
+function importSave(text){
+  const parsed=JSON.parse(text);
+  if(!parsed || !Array.isArray(parsed.leagues)) throw new Error('Invalid Arena Football GM save.');
+  universe=migrateUniverse(parsed);
+  persist();
+  render();
+}
+
+
+let universe=loadUniverse();
+if(!universe){ universe=createUniverse(); createLeague(universe,{name:'Arena Football League',teamCount:4}); saveUniverse(universe); }
+let view='league'; let selectedTeamId=null; let selectedGameId=null; let selectedPlayerId=null;
+const app=document.querySelector('#app'), tabs=document.querySelector('#tabs'), saveStatus=document.querySelector('#saveStatus');
+const league=()=>universe.leagues.find(l=>l.id===universe.activeLeagueId)||universe.leagues[0];
+function persist(){
+  const saved=saveUniverse(universe);
+  saveStatus.textContent=saved ? ('Saved '+new Date().toLocaleTimeString()) : 'Session only';
+}
+function h(s){return String(s).split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;');}
+function nav(){
+  tabs.innerHTML=['league','standings','stats','players','rules','history','schedule','team','game','universe'].map(x=>`<button data-view="${x}" class="${view===x?'active':''}">${x[0].toUpperCase()+x.slice(1)}</button>`).join('');
+  tabs.querySelectorAll('button').forEach(b=>b.onclick=()=>{view=b.dataset.view;render();});
+}
+function render(){ nav(); const l=league(); if(!l){app.innerHTML='<p>No league.</p>';return;} ({league:renderLeague,standings:renderStandings,stats:renderStats,players:renderPlayers,rules:renderRules,history:renderHistory,schedule:renderSchedule,team:renderTeam,player:renderPlayer,game:renderGame,universe:renderUniverse}[view])(); }
+
+function locatePlayer(l,playerId){
+  for(const t of l.teams){const p=t.roster.find(x=>x.id===playerId);if(p)return {p,team:t,status:'roster'};}
+  const fa=(l.freeAgents||[]).find(x=>x.id===playerId);if(fa)return {p:fa,team:null,status:'freeAgent'};
+  const ret=(l.retiredPlayers||[]).find(x=>x.id===playerId);if(ret)return {p:ret,team:null,status:'retired'};
+  return null;
+}
+function allLeaguePlayers(l){
+  return l.teams.flatMap(t=>t.roster.map(p=>({p,t})));
+}
+function playerButton(p){
+  return `<button class="player-link openPlayer" data-player="${p.id}">${h(p.name)}</button>`;
+}
+function wirePlayerLinks(){
+  document.querySelectorAll('.openPlayer').forEach(b=>b.onclick=()=>{selectedPlayerId=b.dataset.player;view='player';render();});
+}
+function pct(a,b){return b?((100*a/b).toFixed(1)+'%'):'—';}
+function per(a,b,d=1){return b?(a/b).toFixed(d):'—';}
+function teamSeasonStats(l,teamId){
+  const out={gp:0,points:0,oppPoints:0,totalYds:0,oppYds:0,passYds:0,rushYds:0,firstDowns:0,turnovers:0,takeaways:0,sacksAllowed:0,penalties:0,penaltyYds:0};
+  for(const g of regularGames(l).filter(g=>g.played&&(g.homeId===teamId||g.awayId===teamId))){
+    const home=g.homeId===teamId,me=home?g.boxScore?.home:g.boxScore?.away,opp=home?g.boxScore?.away:g.boxScore?.home;
+    if(!me||!opp)continue;out.gp++;out.points+=home?g.homeScore:g.awayScore;out.oppPoints+=home?g.awayScore:g.homeScore;
+    out.totalYds+=me.totalYds||0;out.oppYds+=opp.totalYds||0;out.passYds+=me.passYds||0;out.rushYds+=me.rushYds||0;out.firstDowns+=me.firstDowns||0;
+    out.turnovers+=me.turnovers||0;out.takeaways+=opp.turnovers||0;out.sacksAllowed+=me.sacksAllowed||0;out.penalties+=me.penalties||0;out.penaltyYds+=me.penaltyYds||0;
+  }
+  return out;
+}
+function findPlayerSnapshot(l,playerId){
+  for(const t of l.teams){const p=t.roster.find(p=>p.id===playerId);if(p)return {name:p.name,position:p.position,teamId:t.id,teamAbbr:t.abbr,current:true,p};}
+  for(const y of [...(l.completedSeasons||[])].reverse()){const p=(y.playerSeasons||[]).find(p=>p.playerId===playerId);if(p)return {...p,teamAbbr:(y.teamSeasons||[]).find(t=>t.teamId===p.teamId)?.abbr||'—',current:false};}
+  return null;
+}
+function awardRaceRows(l,type,n=5){
+  const all=allLeaguePlayers(l).filter(x=>(x.p.seasonStats?.gp||0)>0),score=type==='Defense'?x=>defensiveAwardScore(x.p):type==='Special Teams'?x=>specialTeamsAwardScore(x.p):x=>offensiveAwardScore(x.p);
+  return all.sort((a,b)=>score(b)-score(a)).slice(0,n).map(x=>({...x,score:score(x)}));
+}
+function playerSeasonSummary(p){
+  const s=p.seasonStats||emptyStats();
+  if(p.position==='QB')return `${s.passCmp}/${s.passAtt}, ${s.passYds} YDS, ${s.passTD} TD, ${s.int} INT`;
+  if(['WR','FB'].includes(p.position))return `${s.rec} REC, ${s.recYds} REC YDS · ${s.rushYds} RUSH YDS · ${s.recTD+s.rushTD} TD`;
+  if(['DL','LB','DB'].includes(p.position))return `${s.tackles} TKL · ${s.sacks} SACK · ${s.defInt} INT · ${s.ff} FF`;
+  if(p.position==='K')return `${s.fgm}/${s.fga} FG · ${s.xpm}/${s.xpa} XP`;
+  return `${s.gp} GP`;
+}
+function leaderCard(title,entries,value){
+  return `<div class="card"><h3>${h(title)}</h3>${entries.length?entries.map((x,i)=>`<div style="display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid #2b3850"><span>${i+1}. ${playerButton(x.p)} <span class="muted small">${h(x.t.abbr)} · ${x.p.position}</span></span><strong>${h(value(x.p.seasonStats||emptyStats(),x.p,x))}</strong></div>`).join(''):'<p class="muted">No stats yet.</p>'}</div>`;
+}
+function renderStats(){
+  const l=league(),all=allLeaguePlayers(l),top=(fn,n=10)=>[...all].sort((a,b)=>fn(b.p)-fn(a.p)).filter(x=>fn(x.p)>0).slice(0,n);
+  const pass=top(p=>p.seasonStats?.passYds||0),rush=top(p=>p.seasonStats?.rushYds||0),rec=top(p=>p.seasonStats?.recYds||0),tackles=top(p=>p.seasonStats?.tackles||0),sacks=top(p=>p.seasonStats?.sacks||0),ints=top(p=>p.seasonStats?.defInt||0),kr=top(p=>p.seasonStats?.krYds||0),kick=top(p=>p.seasonStats?.fgm||0);
+  const teamRows=l.teams.map(t=>({t,s:teamSeasonStats(l,t.id)})).sort((a,b)=>perNum(b.s.points,b.s.gp)-perNum(a.s.points,a.s.gp));
+  const opoy=awardRaceRows(l,'Offense'),dpoy=awardRaceRows(l,'Defense'),st=awardRaceRows(l,'Special Teams');
+  const detailed=(title,rows,headers,cells)=>`<div class="card"><h3>${title}</h3><div class="scroll"><table><thead><tr><th>Player</th><th>Team</th>${headers.map(x=>`<th>${x}</th>`).join('')}</tr></thead><tbody>${rows.map(x=>`<tr><td>${playerButton(x.p)}</td><td>${h(x.t.abbr)}</td>${cells(x.p.seasonStats||emptyStats()).map(v=>`<td>${v}</td>`).join('')}</tr>`).join('')}</tbody></table></div></div>`;
+  app.innerHTML=`<div class="card"><h2>${l.season} Statistics</h2><p class="muted">Every total below is derived from completed game events. Award races are statistical leaderboards, not hidden preselected outcomes.</p></div>
+  <div class="card"><h3>Team Rankings</h3><div class="scroll"><table><thead><tr><th>Team</th><th>GP</th><th>PPG</th><th>Opp PPG</th><th>YPG</th><th>Pass</th><th>Rush</th><th>TO Diff</th></tr></thead><tbody>${teamRows.map(({t,s})=>`<tr><td>${h(t.name)}</td><td>${s.gp}</td><td>${perNum(s.points,s.gp).toFixed(1)}</td><td>${perNum(s.oppPoints,s.gp).toFixed(1)}</td><td>${perNum(s.totalYds,s.gp).toFixed(1)}</td><td>${perNum(s.passYds,s.gp).toFixed(1)}</td><td>${perNum(s.rushYds,s.gp).toFixed(1)}</td><td>${(s.takeaways-s.turnovers)>=0?'+':''}${s.takeaways-s.turnovers}</td></tr>`).join('')}</tbody></table></div></div>
+  <div class="grid">
+    ${leaderCard('Passing Leaders',pass,s=>`${s.passYds} YDS · ${s.passTD} TD`)}${leaderCard('Rushing Leaders',rush,s=>`${s.rushYds} YDS · ${s.rushTD} TD`)}${leaderCard('Receiving Leaders',rec,s=>`${s.recYds} YDS · ${s.recTD} TD`)}${leaderCard('Tackle Leaders',tackles,s=>`${s.tackles} TKL`)}${leaderCard('Sack Leaders',sacks,s=>`${s.sacks} SACK`)}${leaderCard('Interception Leaders',ints,s=>`${s.defInt} INT`)}${leaderCard('Kick Return Leaders',kr,s=>`${s.krYds} YDS · ${s.krTD} TD`)}${leaderCard('Kicking Leaders',kick,s=>`${s.fgm}/${s.fga} FG`)}
+  </div>
+  <div class="card"><h2>Award Races</h2><p class="muted">Current statistical cases based only on this season's production.</p></div><div class="grid">
+    ${leaderCard('Offensive Player of the Year',opoy,(s,p,x)=>x.score.toFixed(1))}${leaderCard('Defensive Player of the Year',dpoy,(s,p,x)=>x.score.toFixed(1))}${leaderCard('Special Teams Player of the Year',st,(s,p,x)=>x.score.toFixed(1))}
+  </div>
+  ${detailed('Passing',pass,['CMP/ATT','CMP%','YDS','TD','INT','Y/A'],s=>[`${s.passCmp}/${s.passAtt}`,pct(s.passCmp,s.passAtt),s.passYds,s.passTD,s.int,per(s.passYds,s.passAtt)])}
+  ${detailed('Rushing',rush,['ATT','YDS','AVG','TD'],s=>[s.rushAtt,s.rushYds,per(s.rushYds,s.rushAtt),s.rushTD])}
+  ${detailed('Receiving',rec,['REC','YDS','AVG','TD'],s=>[s.rec,s.recYds,per(s.recYds,s.rec),s.recTD])}
+  ${detailed('Defense',top(p=>(p.seasonStats?.tackles||0)+(p.seasonStats?.sacks||0)*5+(p.seasonStats?.defInt||0)*8),['TKL','SACK','INT','FF','FR','TD'],s=>[s.tackles,s.sacks,s.defInt,s.ff,s.fr,s.defTD])}
+  <div class="card"><h3>Player Directory</h3><div class="scroll"><table><thead><tr><th>Player</th><th>Team</th><th>Pos</th><th>Age</th><th>OVR</th><th>${l.season} production</th></tr></thead><tbody>${[...all].sort((a,b)=>a.p.position.localeCompare(b.p.position)||b.p.ratings.overall-a.p.ratings.overall).map(x=>`<tr><td>${playerButton(x.p)}</td><td>${h(x.t.abbr)}</td><td>${x.p.position}</td><td>${x.p.age}</td><td>${x.p.ratings.overall}</td><td>${h(playerSeasonSummary(x.p))}</td></tr>`).join('')}</tbody></table></div></div>`;
+  wirePlayerLinks();
+}
+function perNum(a,b){return b?(a/b):0;}
+function relevantRatings(p){
+  const groups={
+    QB:['overall','passShort','passMedium','passDeep','armStrength','decision','scramble','awareness','stamina'],
+    WR:['overall','speed','acceleration','catching','routeRunning','release','contestedCatch','ballSecurity','motion','wallAwareness'],
+    FB:['overall','speed','strength','vision','power','elusiveness','breakTackle','ballSecurity','runBlock','twoWay'],
+    OL:['overall','strength','passBlock','runBlock','blockStrength','stamina','twoWay'],
+    DL:['overall','strength','passRush','blockShedding','pursuit','tackling','stamina','twoWay'],
+    LB:['overall','speed','tackling','pursuit','zoneCoverage','manCoverage','passRush','twoWay'],
+    DB:['overall','speed','acceleration','manCoverage','zoneCoverage','tackling','pursuit','wallAwareness','twoWay'],
+    K:['overall','kickPower','kickAccuracy','kickoff','dropKick','stamina']
+  };
+  return groups[p.position]||['overall','speed','strength','awareness','stamina'];
+}
+function statTableForPlayer(p,s,label){
+  const common=`<tr><td>Games</td><td>${s.gp||0}</td></tr>`;
+  let rows='';
+  if(p.position==='QB'||s.passAtt)rows+=`<tr><td>Passing</td><td>${s.passCmp||0}/${s.passAtt||0} (${pct(s.passCmp||0,s.passAtt||0)}) · ${s.passYds||0} YDS · ${s.passTD||0} TD · ${s.int||0} INT · ${per(s.passYds||0,s.passAtt||0)} Y/A</td></tr>`;
+  if(['QB','FB','WR'].includes(p.position)||s.rushAtt)rows+=`<tr><td>Rushing</td><td>${s.rushAtt||0} ATT · ${s.rushYds||0} YDS · ${s.rushTD||0} TD · ${per(s.rushYds||0,s.rushAtt||0)} Y/A</td></tr>`;
+  if(['WR','FB'].includes(p.position)||s.rec)rows+=`<tr><td>Receiving</td><td>${s.rec||0} REC · ${s.recYds||0} YDS · ${s.recTD||0} TD · ${per(s.recYds||0,s.rec||0)} Y/R</td></tr>`;
+  if(['DL','LB','DB'].includes(p.position)||s.tackles||s.sacks||s.defInt)rows+=`<tr><td>Defense</td><td>${s.tackles||0} TKL · ${s.sacks||0} SACK · ${s.defInt||0} INT · ${s.ff||0} FF · ${s.fr||0} FR · ${s.defTD||0} TD</td></tr>`;
+  if(p.position==='K'||s.fga||s.xpa)rows+=`<tr><td>Kicking</td><td>${s.fgm||0}/${s.fga||0} FG · ${s.xpm||0}/${s.xpa||0} XP</td></tr>`;
+  if(s.kr||s.pr)rows+=`<tr><td>Returns</td><td>${s.kr||0} KR, ${s.krYds||0} YDS · ${s.pr||0} PR, ${s.prYds||0} YDS</td></tr>`;
+  return `<div class="card"><h3>${h(label)}</h3><div class="scroll"><table>${common}${rows}</table></div></div>`;
+}
+function renderPlayer(){
+  const l=league(),found=locatePlayer(l,selectedPlayerId);if(!found){app.innerHTML='<div class="card">Player not found.</div>';return;}
+  const {p,team,status}=found,r=p.ratings||{},ratings=relevantRatings(p),statusText=status==='retired'?`Retired ${p.retiredSeason||''}`:status==='freeAgent'?'Free Agent':(p.injuredGames?`Injured (${p.injuredGames} game${p.injuredGames===1?'':'s'} remaining)`:'Active');
+  app.innerHTML=`<div class="card">${team?`<button id="backTeam">← ${h(team.abbr)} roster</button>`:`<button id="backPlayers">← Player World</button>`}<h2>#${p.jerseyNumber} ${h(p.name)}</h2><p>${p.position} · ${team?h(team.name):h(statusText)} · Age ${p.age} · ${p.experience} yrs exp</p><p class="muted">${formatHeight(p.heightInches)} · ${p.weight} lb · ${h(p.hometown)} · ${h(p.archetype||'Balanced')} · ${h(statusText)}</p><div class="statline"><span><strong>${r.overall}</strong><br><span class="muted small">OVR</span></span><span><strong>${p.potential??'—'}</strong><br><span class="muted small">POT</span></span><span><strong>${Math.round(p.fatigue||0)}</strong><br><span class="muted small">Fatigue</span></span><span><strong>${p.seasonStats?.gp||0}</strong><br><span class="muted small">Games</span></span></div></div>
+  ${statTableForPlayer(p,p.seasonStats||emptyStats(),`${l.season} Statistics`)}
+  ${statTableForPlayer(p,p.stats||emptyStats(),'Career Statistics')}
+  <div class="card"><h3>Participation</h3><p>Offense: <strong>${p.seasonStats?.offSnaps||0}</strong> snaps · Defense: <strong>${p.seasonStats?.defSnaps||0}</strong> snaps${(l.rules.ironman||l.rules.personnel?.ironman)?' · Ironman rules active':''}</p></div>
+  <div class="card"><h3>Ratings</h3><div class="scroll"><table><tbody>${ratings.map(k=>`<tr><td>${h(k.replace(/([A-Z])/g,' $1').replace(/^./,x=>x.toUpperCase()))}</td><td><strong>${r[k]??'—'}</strong></td></tr>`).join('')}</tbody></table></div></div>
+  <div class="card"><h3>Awards</h3>${(p.awards||[]).length?[...p.awards].reverse().map(a=>`<p><strong>${a.season}</strong> · ${h(a.type)}</p>`).join(''):'<p class="muted">No league awards yet.</p>'}</div>
+  <div class="card"><h3>Career History</h3>${(p.history||[]).length?`<div class="scroll"><table><thead><tr><th>Season</th><th>Team</th><th>Age</th><th>Summary</th></tr></thead><tbody>${[...p.history].reverse().map(y=>{const fake={...p,seasonStats:y.stats};return `<tr><td>${y.season}</td><td>${h(y.teamAbbr||l.teams.find(t=>t.id===y.teamId)?.abbr||'—')}</td><td>${y.age}</td><td>${h(playerSeasonSummary(fake))}</td></tr>`}).join('')}</tbody></table></div>`:'<p class="muted">Career history begins after the first completed season.</p>'}</div>`;
+  if(status==='freeAgent'){
+    const controls=document.createElement('div');controls.className='card';controls.innerHTML=`<h3>Commissioner Roster Move</h3><label>Sign to <select id="signTeam">${l.teams.map(t=>`<option value="${t.id}">${h(t.name)}</option>`).join('')}</select></label> <button id="signPlayerBtn">Sign Player</button>`;app.appendChild(controls);document.querySelector('#signPlayerBtn').onclick=()=>{const t=l.teams.find(x=>x.id===document.querySelector('#signTeam').value);signPlayer(l,t,p,'Manual commissioner signing');ensureDepthChart(t,l.rules);persist();selectedTeamId=t.id;view='team';render();};
+  }else if(team){
+    const required=rosterTemplateForRules(l.rules).filter(x=>x===p.position).length,current=team.roster.filter(x=>x.position===p.position).length;
+    if(current>required){const controls=document.createElement('div');controls.className='card';controls.innerHTML='<h3>Commissioner Roster Move</h3><button id="releasePlayerBtn">Release to Free Agents</button>';app.appendChild(controls);document.querySelector('#releasePlayerBtn').onclick=()=>{releasePlayer(l,team,p,'Manual commissioner release');persist();view='players';render();};}
+  }
+  if(team)document.querySelector('#backTeam').onclick=()=>{selectedTeamId=team.id;view='team';render();};else document.querySelector('#backPlayers').onclick=()=>{view='players';render();};
+}
+
+function gamePlayerRows(team,g){
+  const lookup=new Map(team.roster.map(p=>[p.id,p])),gs=g.gameStats?.players||{};
+  return Object.entries(gs).map(([id,st])=>({p:lookup.get(id),st})).filter(x=>x.p&&Object.values(x.st).some(v=>Number(v)>0));
+}
+function gameStatSections(team,g){
+  const rows=gamePlayerRows(team,g),sort=(fn)=>[...rows].sort((a,b)=>fn(b.st)-fn(a.st));
+  const passing=sort(s=>s.passAtt).filter(x=>x.st.passAtt),rushing=sort(s=>s.rushAtt).filter(x=>x.st.rushAtt),receiving=sort(s=>s.rec).filter(x=>x.st.rec),
+        defense=sort(s=>s.tackles+s.sacks*3+s.defInt*4).filter(x=>x.st.tackles||x.st.sacks||x.st.defInt||x.st.ff||x.st.fr),
+        kicking=sort(s=>s.fga+s.xpa).filter(x=>x.st.fga||x.st.xpa),returns=sort(s=>s.krYds+s.prYds).filter(x=>x.st.kr||x.st.pr);
+  const table=(title,list,cols,cell)=>list.length?`<h4>${title}</h4><div class="scroll"><table><thead><tr><th>Player</th>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead><tbody>${list.map(x=>`<tr><td>${playerButton(x.p)}</td>${cell(x.st).map(v=>`<td>${v}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`:'';
+  return `<div class="card"><h3>${h(team.name)}</h3>
+    ${table('Passing',passing,['C/ATT','YDS','TD','INT'],s=>[`${s.passCmp}/${s.passAtt}`,s.passYds,s.passTD,s.int])}
+    ${table('Rushing',rushing,['ATT','YDS','TD'],s=>[s.rushAtt,s.rushYds,s.rushTD])}
+    ${table('Receiving',receiving,['REC','YDS','TD'],s=>[s.rec,s.recYds,s.recTD])}
+    ${table('Defense',defense,['TKL','SACK','INT','FF','FR'],s=>[s.tackles,s.sacks,s.defInt,s.ff,s.fr])}
+    ${table('Kicking',kicking,['FG','XP'],s=>[`${s.fgm}/${s.fga}`,`${s.xpm}/${s.xpa}`])}
+    ${table('Returns',returns,['KR-YDS','PR-YDS'],s=>[`${s.kr}-${s.krYds}`,`${s.pr}-${s.prYds}`])}
+  </div>`;
+}
+
+function renderLeague(){
+  const l=league(),next=l.schedule.find(g=>!g.played),advanceLabel=l.phase==='regularSeason'?'Start Playoffs':l.phase==='offseason'?'Start Next Season':'Advance Season';
+  app.innerHTML=`<div class="card"><h2>${h(l.name)} — ${l.season}</h2><p class="muted">${l.teams.length} teams · ${l.rules.fieldLength}-yard field · ${l.rules.playersOnField}-man football · ${h(l.phase)} · Sim Engine v1.4</p>
+  <div class="actions"><button id="simNext" ${!next?'disabled':''}>Sim Next Game</button><button id="simWeek" ${!next?'disabled':''}>Sim All Remaining</button><button id="advance" ${next?'disabled':''}>${advanceLabel}</button></div></div>
+  <div class="card"><strong>Player movement:</strong> ${(l.freeAgents||[]).length} free agents · ${(l.retiredPlayers||[]).length} retired players · ${(l.transactions||[]).length} transactions</div><div class="grid">${l.teams.map(t=>`<div class="card"><h3>${h(t.name)}</h3><div class="score">${t.wins}-${t.losses}</div><p>PF ${t.pf} · PA ${t.pa}</p><button class="openTeam" data-id="${t.id}">Open Team</button></div>`).join('')}</div>
+  <div class="card"><h3>League Snapshot</h3>${(()=>{const all=allLeaguePlayers(l),best=(k)=>[...all].sort((a,b)=>(b.p.seasonStats?.[k]||0)-(a.p.seasonStats?.[k]||0))[0];const p=best('passYds'),r=best('rushYds'),c=best('recYds'),d=best('tackles');return `<p>Passing: ${p?playerButton(p.p):'—'} ${p?.p.seasonStats?.passYds||0} YDS · Rushing: ${r?playerButton(r.p):'—'} ${r?.p.seasonStats?.rushYds||0} YDS</p><p>Receiving: ${c?playerButton(c.p):'—'} ${c?.p.seasonStats?.recYds||0} YDS · Tackles: ${d?playerButton(d.p):'—'} ${d?.p.seasonStats?.tackles||0}</p>`})()}</div>`;
+  document.querySelectorAll('.openTeam').forEach(b=>b.onclick=()=>{selectedTeamId=b.dataset.id;view='team';render();});wirePlayerLinks();
+  document.querySelector('#simNext').onclick=()=>simGame(next);
+  document.querySelector('#simWeek').onclick=()=>{let g;let guard=0;while((g=l.schedule.find(x=>!x.played))&&guard++<200)simGame(g,false);persist();render();};
+  document.querySelector('#advance').onclick=()=>{try{advanceSeason(l);persist();render();}catch(e){alert(e.message);}};
+}
+function renderStandings(){ const l=league(); app.innerHTML=`<div class="card"><h2>Standings</h2><div class="scroll"><table><thead><tr><th>Team</th><th>W</th><th>L</th><th>T</th><th>PCT</th><th>Home</th><th>Away</th><th>STRK</th><th>PF</th><th>PA</th><th>DIFF</th></tr></thead><tbody>${standings(l).map(t=>`<tr><td>${h(t.name)}</td><td>${t.wins}</td><td>${t.losses}</td><td>${t.ties}</td><td>${((t.wins+.5*t.ties)/Math.max(1,t.gamesPlayed)).toFixed(3)}</td><td>${t.homeWins}-${t.homeLosses}</td><td>${t.awayWins}-${t.awayLosses}</td><td>${h(t.streak||'—')}</td><td>${t.pf}</td><td>${t.pa}</td><td>${t.pf-t.pa>=0?'+':''}${t.pf-t.pa}</td></tr>`).join('')}</tbody></table></div></div>`; }
+function renderRules(){
+  const l=league(),r=normalizeRules(l.pendingRules||l.rules),played=regularGames(l).some(g=>g.played),defer=played||l.phase!=='regularSeason';
+  const checked=v=>v?'checked':'';
+  app.innerHTML=`<div class="card"><h2>Rules Editor</h2><p class="muted">These settings feed the same Ruleset used by the simulation. ${defer?'Because the current season has already started, saved changes will become active next season.':'No regular-season games have been played, so changes can apply immediately.'}</p>${l.pendingRules?'<p class="good"><strong>Pending ruleset saved for next season.</strong></p>':''}</div>
+  <div class="grid">
+    <div class="card"><h3>Field & Personnel</h3><label>Ruleset name<br><input id="ruleName" value="${h(r.name||'Custom Arena')}" style="width:100%;box-sizing:border-box"></label><p><label>Field length <input id="fieldLength" type="number" min="30" max="100" value="${r.field.length}"></label></p><p><label>Field width <input id="fieldWidth" type="number" min="20" max="60" value="${r.field.width}"></label></p><p><label>Players per side <select id="playersPerSide">${[6,7,8,9].map(n=>`<option ${r.personnel.playersPerSide===n?'selected':''}>${n}</option>`).join('')}</select></label></p><p><label><input id="liveWalls" type="checkbox" ${checked(r.field.walls==='live')}> Live walls</label></p><p><label><input id="ironmanRule" type="checkbox" ${checked(r.personnel.ironman)}> Ironman</label></p></div>
+    <div class="card"><h3>Motion & Defense</h3><p><label><input id="highMotionRule" type="checkbox" ${checked(r.personnel.highMotion)}> High motion</label></p><p><label>Motion players <select id="motionPlayers"><option ${r.personnel.motionPlayers===1?'selected':''}>1</option><option ${r.personnel.motionPlayers===2?'selected':''}>2</option></select></label></p><p><label>Jack restrictions <select id="jackRule"><option value="classic" ${r.defense.jackRestriction==='classic'?'selected':''}>Classic</option><option value="free" ${r.defense.jackRestriction==='free'?'selected':''}>Free</option></select></label></p><p><label><input id="freeBlitzRule" type="checkbox" ${checked(r.defense.allowFreeBlitz)}> Free blitzing</label></p></div>
+    <div class="card"><h3>Kicking & Arena Scoring</h3><p><label><input id="reboundRule" type="checkbox" ${checked(r.kicking.reboundNets)}> Rebound nets</label></p><p><label><input id="puntRule" type="checkbox" ${checked(r.kicking.punting)}> Punting</label></p><p><label><input id="dropKickRule" type="checkbox" ${checked(r.kicking.dropKicks)}> Drop kicks</label></p><p><label><input id="deuceRule" type="checkbox" ${checked(r.kicking.deuce.enabled)}> Deuce</label></p><p><label><input id="rougeRule" type="checkbox" ${checked(r.kicking.rouge.enabled)}> Rouge</label></p></div>
+    <div class="card"><h3>Clock & Scoring</h3><p><label>Quarter minutes <input id="quarterMinutes" type="number" min="5" max="20" value="${r.quarterMinutes}"></label></p><p><label><input id="runningClockRule" type="checkbox" ${checked(r.clock.runningClock)}> Running clock</label></p><p><label>Touchdown <input id="tdPoints" type="number" min="1" max="12" value="${r.scoring.td}"></label></p><p><label>Field goal <input id="fgPoints" type="number" min="1" max="8" value="${r.scoring.fg}"></label></p><p><label>Drop-kick FG <input id="dropFgPoints" type="number" min="1" max="8" value="${r.scoring.dropFg}"></label></p></div>
+  </div><div class="card"><button id="saveRules">${defer?'Save for Next Season':'Apply Rules Now'}</button> <button id="resetRules">Load Base Arena Preset</button></div>`;
+  const number=(id,min,max)=>clamp(Number(document.querySelector('#'+id).value)||min,min,max),check=id=>document.querySelector('#'+id).checked;
+  document.querySelector('#saveRules').onclick=()=>{
+    const next=normalizeRules(r);next.name=document.querySelector('#ruleName').value.trim()||'Custom Arena';next.fieldLength=next.field.length=number('fieldLength',30,100);next.fieldWidth=next.field.width=number('fieldWidth',20,60);next.playersOnField=next.personnel.playersPerSide=number('playersPerSide',4,12);
+    next.wallsInPlay=check('liveWalls');next.field.walls=next.wallsInPlay?'live':'boundary';next.ironman=next.personnel.ironman=check('ironmanRule');next.personnel.substitutionMode=next.ironman?'ironman':'free';next.highMotion=next.personnel.highMotion=check('highMotionRule');next.motion.offensivePlayers=next.personnel.motionPlayers=number('motionPlayers',1,2);next.secondMotionMan=next.motion.secondMotionMan=next.personnel.motionPlayers>1;
+    next.jackRestrictions=next.defense.jackRestriction=document.querySelector('#jackRule').value;next.defense.allowFreeBlitz=check('freeBlitzRule');next.reboundNets=next.kicking.reboundNets=check('reboundRule');next.punting=next.kicking.punting=check('puntRule');next.dropKicks=next.kicking.dropKicks=check('dropKickRule');next.deuce=next.kicking.deuce.enabled=check('deuceRule');next.rouge=next.kicking.rouge.enabled=check('rougeRule');next.quarterMinutes=number('quarterMinutes',5,20);next.runningClock=next.clock.runningClock=check('runningClockRule');next.scoring.td=number('tdPoints',1,12);next.scoring.fg=number('fgPoints',1,8);next.scoring.dropFg=number('dropFgPoints',1,8);
+    const slots=slotCountsFor(next.personnel.playersPerSide);next.personnel.offenseSlots=slots.offense;next.personnel.defenseSlots=slots.defense;
+    if(defer)l.pendingRules=next;else{l.rules=next;l.pendingRules=null;for(const t of l.teams){t.depthChart=null;repairTeamRoster(l,t);}}
+    persist();render();
+  };
+  document.querySelector('#resetRules').onclick=()=>{l.pendingRules=deepClone(DEFAULT_RULES);if(!defer){l.rules=normalizeRules(DEFAULT_RULES);l.pendingRules=null;for(const t of l.teams){t.depthChart=null;repairTeamRoster(l,t);}}persist();render();};
+}
+function renderPlayers(){
+  const l=league(),fa=[...(l.freeAgents||[])].sort((a,b)=>(b.ratings?.overall||0)-(a.ratings?.overall||0)),ret=[...(l.retiredPlayers||[])].sort((a,b)=>(b.retiredSeason||0)-(a.retiredSeason||0)).slice(0,30),tx=[...(l.transactions||[])].reverse().slice(0,40);
+  const teamAbbr=id=>l.teams.find(t=>t.id===id)?.abbr||'—';
+  app.innerHTML=`<div class="card"><h2>Player World</h2><p class="muted">Free agents, retirements, and roster movement are persistent league data. CPU teams repair illegal rosters automatically during the offseason.</p></div>
+  <div class="card"><h3>Free Agents (${fa.length})</h3><div class="scroll"><table><thead><tr><th>Pos</th><th>Player</th><th>Age</th><th>OVR</th><th>POT</th><th>Archetype</th></tr></thead><tbody>${fa.slice(0,60).map(p=>`<tr><td>${p.position}</td><td>${playerButton(p)}</td><td>${p.age}</td><td><strong>${p.ratings.overall}</strong></td><td>${p.potential??'—'}</td><td>${h(p.archetype||'Balanced')}</td></tr>`).join('')}</tbody></table></div></div>
+  <div class="grid"><div class="card"><h3>Recent Transactions</h3>${tx.length?tx.map(x=>`<p><strong>${x.season}</strong> · ${h(x.type.replace(/_/g,' '))} · ${h(x.playerName)} ${x.fromTeamId?teamAbbr(x.fromTeamId)+' → ':''}${x.toTeamId?teamAbbr(x.toTeamId):''}<br><span class="muted small">${h(x.details||'')}</span></p>`).join(''):'<p class="muted">No transactions yet.</p>'}</div>
+  <div class="card"><h3>Retired Players</h3>${ret.length?ret.map(p=>`<p>${playerButton(p)} · ${p.position} · retired ${p.retiredSeason||'—'} · ${p.stats?.gp||0} GP</p>`).join(''):'<p class="muted">No retirements yet.</p>'}</div></div>`;wirePlayerLinks();
+}
+function renderHistory(){
+  const l=league(),currentRecords=ensureLeagueRecords(l),teamName=id=>l.teams.find(t=>t.id===id)?.name||'Unknown Team';
+  const recName={teamPoints:'Team Points',passingYards:'Passing Yards',passingTD:'Passing TD',rushingYards:'Rushing Yards',rushingTD:'Rushing TD',receivingYards:'Receiving Yards',receivingTD:'Receiving TD',tackles:'Tackles',sacks:'Sacks',defInterceptions:'Defensive INT',fieldGoals:'Field Goals',returnYards:'Return Yards',teamWins:'Team Wins',teamPoints:'Team Points',kickReturnYards:'Kick Return Yards'};
+  const recordRows=(obj,type)=>Object.entries(obj||{}).filter(([,r])=>r&&Number.isFinite(r.value)).map(([k,r])=>{const ps=r.playerId?findPlayerSnapshot(l,r.playerId):null;const who=ps?`${ps.name} (${ps.teamAbbr||'—'})`:r.teamId?teamName(r.teamId):'—';return `<tr><td>${h(recName[k]||k)}</td><td><strong>${r.value}</strong></td><td>${h(who)}</td><td>${r.season||'—'}</td></tr>`}).join('');
+  const seasons=[...(l.completedSeasons||[])].reverse();
+  app.innerHTML=`<div class="card"><h2>League History</h2><p class="muted">Champions, awards, records, standings, and statistical leaders are preserved by season.</p></div>
+  <div class="grid"><div class="card"><h3>Single-Game Records</h3><div class="scroll"><table><thead><tr><th>Record</th><th>Value</th><th>Holder</th><th>Season</th></tr></thead><tbody>${recordRows(currentRecords.game,'game')||'<tr><td colspan="4">No records yet.</td></tr>'}</tbody></table></div></div>
+  <div class="card"><h3>Single-Season Records</h3><div class="scroll"><table><thead><tr><th>Record</th><th>Value</th><th>Holder</th><th>Season</th></tr></thead><tbody>${recordRows(currentRecords.season,'season')||'<tr><td colspan="4">No completed-season records yet.</td></tr>'}</tbody></table></div></div><div class="card"><h3>Career Records</h3><div class="scroll"><table><thead><tr><th>Record</th><th>Value</th><th>Holder</th><th>Through</th></tr></thead><tbody>${recordRows(currentRecords.career,'career')||'<tr><td colspan="4">Career records begin after the first completed season.</td></tr>'}</tbody></table></div></div></div>
+  ${seasons.length?seasons.map(y=>{const champ=(y.teamSeasons||[]).find(t=>t.teamId===y.championTeamId),leaders=(y.playerSeasons||[]),top=(key)=>[...leaders].sort((a,b)=>(b.stats?.[key]||0)-(a.stats?.[key]||0))[0];const lp=top('passYds'),lr=top('rushYds'),lrec=top('recYds');return `<div class="card"><h3>${y.season} Season</h3><p><strong>Champion:</strong> ${h(champ?.name||'—')}</p>${(y.awards||[]).length?`<p><strong>Awards:</strong> ${(y.awards||[]).map(a=>`${h(a.type)} — ${h(a.name)} (${h((y.teamSeasons||[]).find(t=>t.teamId===a.teamId)?.abbr||'—')})`).join(' · ')}</p>`:''}<p><strong>Leaders:</strong> Passing ${h(lp?.name||'—')} ${lp?.stats?.passYds||0} · Rushing ${h(lr?.name||'—')} ${lr?.stats?.rushYds||0} · Receiving ${h(lrec?.name||'—')} ${lrec?.stats?.recYds||0}</p><div class="scroll"><table><thead><tr><th>Rank</th><th>Team</th><th>W</th><th>L</th><th>T</th><th>PF</th><th>PA</th></tr></thead><tbody>${(y.standings||[]).map(r=>`<tr><td>${r.rank}</td><td>${h(r.name||((y.teamSeasons||[]).find(t=>t.teamId===r.teamId)?.name)||'—')}</td><td>${r.w}</td><td>${r.l}</td><td>${r.t}</td><td>${r.pf}</td><td>${r.pa}</td></tr>`).join('')}</tbody></table></div></div>`}).join(''):'<div class="card"><p class="muted">Complete a season to begin league history.</p></div>'}`;
+}
+function renderSchedule(){
+  const l=league();app.innerHTML=`<div class="card"><h2>${l.season} Schedule</h2><table><tbody>${l.schedule.map(g=>{const H=l.teams.find(t=>t.id===g.homeId),A=l.teams.find(t=>t.id===g.awayId),label=g.stage==='playoff'?(g.playoffLabel||'Playoff'):`Week ${g.week}`;return `<tr><td>${h(label)}</td><td>${h(A.abbr)} @ ${h(H.abbr)}</td><td>${g.played?`${g.awayScore}-${g.homeScore}`:`<button class="sim" data-id="${g.id}">Sim</button>`}</td><td>${g.played?`<button class="box" data-id="${g.id}">View</button>`:''}</td></tr>`}).join('')}</tbody></table></div>`;
+  document.querySelectorAll('.sim').forEach(b=>b.onclick=()=>simGame(l.schedule.find(g=>g.id===b.dataset.id)));
+  document.querySelectorAll('.box').forEach(b=>b.onclick=()=>{selectedGameId=b.dataset.id;view='game';render();});
+}
+function renderTeam(){
+  const l=league(),t=l.teams.find(x=>x.id===selectedTeamId)||l.teams[0];selectedTeamId=t.id;
+  const sorted=[...t.roster].sort((a,b)=>a.position.localeCompare(b.position)||b.ratings.overall-a.ratings.overall),chart=ensureDepthChart(t,l.rules),byId=new Map(t.roster.map(p=>[p.id,p]));
+  const leaders={pass:[...t.roster].sort((a,b)=>(b.seasonStats?.passYds||0)-(a.seasonStats?.passYds||0))[0],rush:[...t.roster].sort((a,b)=>(b.seasonStats?.rushYds||0)-(a.seasonStats?.rushYds||0))[0],rec:[...t.roster].sort((a,b)=>(b.seasonStats?.recYds||0)-(a.seasonStats?.recYds||0))[0],def:[...t.roster].sort((a,b)=>((b.seasonStats?.tackles||0)+(b.seasonStats?.sacks||0)*5+(b.seasonStats?.defInt||0)*8)-((a.seasonStats?.tackles||0)+(a.seasonStats?.sacks||0)*5+(a.seasonStats?.defInt||0)*8))[0]};
+  const ts=teamSeasonStats(l,t.id),championships=(t.history||[]).filter(y=>y.champion).length;
+  const names=ids=>(ids||[]).map(id=>byId.get(id)).filter(Boolean).map(playerButton).join(', ')||'—';
+  app.innerHTML=`<div class="card"><h2>${h(t.name)}</h2><p>${t.wins}-${t.losses}-${t.ties} · PF ${t.pf} · PA ${t.pa} · ${championships} championship${championships===1?'':'s'}</p><div class="statline"><span><strong>${perNum(ts.points,ts.gp).toFixed(1)}</strong><br><span class="muted small">PPG</span></span><span><strong>${perNum(ts.totalYds,ts.gp).toFixed(1)}</strong><br><span class="muted small">YPG</span></span><span><strong>${ts.takeaways-ts.turnovers>=0?'+':''}${ts.takeaways-ts.turnovers}</strong><br><span class="muted small">TO Diff</span></span></div></div>
+  <div class="grid">
+    <div class="card"><h3>Team Leaders</h3><p>Passing: ${leaders.pass?playerButton(leaders.pass):'—'} · ${leaders.pass?.seasonStats?.passYds||0} YDS</p><p>Rushing: ${leaders.rush?playerButton(leaders.rush):'—'} · ${leaders.rush?.seasonStats?.rushYds||0} YDS</p><p>Receiving: ${leaders.rec?playerButton(leaders.rec):'—'} · ${leaders.rec?.seasonStats?.recYds||0} YDS</p><p>Defense: ${leaders.def?playerButton(leaders.def):'—'} · ${leaders.def?.seasonStats?.tackles||0} TKL</p></div>
+    <div class="card"><h3>Depth Chart</h3><p><strong>QB:</strong> ${names([chart.offense.QB])}</p><p><strong>FB:</strong> ${names([chart.offense.FB])}</p><p><strong>WR:</strong> ${names(chart.offense.WR)}</p><p><strong>OL:</strong> ${names(chart.offense.OL)}</p><p><strong>DL:</strong> ${names(chart.defense.DL)}</p><p><strong>LB:</strong> ${names([chart.defense.LB])}</p><p><strong>DB:</strong> ${names(chart.defense.DB)}</p></div>
+  </div>
+  <div class="card"><h3>Roster</h3><p class="muted">Tap a player to open their profile and full statistics.</p><div class="scroll"><table><thead><tr><th>#</th><th>Pos</th><th>Player</th><th>Age</th><th>OVR</th><th>POT</th><th>Archetype</th><th>Snaps O/D</th><th>Fatigue</th><th>Status</th><th>${l.season} production</th></tr></thead><tbody>${sorted.map(p=>`<tr><td>${p.jerseyNumber}</td><td>${p.position}</td><td>${playerButton(p)}</td><td>${p.age}</td><td><strong>${p.ratings.overall}</strong></td><td>${p.potential??'—'}</td><td>${h(p.archetype||'Balanced')}</td><td>${p.seasonStats?.offSnaps||0}/${p.seasonStats?.defSnaps||0}</td><td>${Math.round(p.fatigue||0)}</td><td>${p.injuredGames?`INJ ${p.injuredGames}`:'Active'}</td><td>${h(playerSeasonSummary(p))}</td></tr>`).join('')}</tbody></table></div></div>
+  <div class="card"><h3>Franchise History</h3>${(t.history||[]).length?`<div class="scroll"><table><thead><tr><th>Season</th><th>Record</th><th>PF</th><th>PA</th><th>Result</th></tr></thead><tbody>${[...t.history].reverse().map(y=>`<tr><td>${y.season}</td><td>${y.w}-${y.l}-${y.t}</td><td>${y.pf}</td><td>${y.pa}</td><td>${y.champion?'Champion':'—'}</td></tr>`).join('')}</tbody></table></div>`:'<p class="muted">Franchise history begins after a completed season.</p>'}</div>`;
+  wirePlayerLinks();
+}
+function renderGame(){
+  const l=league(),g=l.schedule.find(x=>x.id===selectedGameId)||l.schedule.find(x=>x.played);
+  if(!g){app.innerHTML='<div class="card">No completed game yet.</div>';return;}
+  const H=l.teams.find(t=>t.id===g.homeId),A=l.teams.find(t=>t.id===g.awayId),B=g.boxScore||{};
+  app.innerHTML=`<div class="card"><h2>${h(A.name)} @ ${h(H.name)}</h2><div class="score">${A.abbr} ${g.awayScore} — ${H.abbr} ${g.homeScore}</div><p class="muted">Simulation engine ${g.engineVersion||'legacy'} · ${(g.drives||[]).length} drives · player and team stats derived from the event log</p></div>
+  <div class="card"><h3>Team stats</h3><div class="scroll"><table><tr><th></th><th>${A.abbr}</th><th>${H.abbr}</th></tr>
+  <tr><td>First downs</td><td>${B.away?.firstDowns??'-'}</td><td>${B.home?.firstDowns??'-'}</td></tr>
+  <tr><td>Total yards</td><td>${B.away?.totalYds??'-'}</td><td>${B.home?.totalYds??'-'}</td></tr>
+  <tr><td>Rush</td><td>${B.away?.rushAtt??'-'}-${B.away?.rushYds??'-'}</td><td>${B.home?.rushAtt??'-'}-${B.home?.rushYds??'-'}</td></tr>
+  <tr><td>Passing</td><td>${B.away?.completions??'-'}/${B.away?.passAtt??'-'}-${B.away?.passYds??'-'}</td><td>${B.home?.completions??'-'}/${B.home?.passAtt??'-'}-${B.home?.passYds??'-'}</td></tr>
+  <tr><td>Turnovers</td><td>${B.away?.turnovers??'-'}</td><td>${B.home?.turnovers??'-'}</td></tr>
+  <tr><td>Sacks allowed</td><td>${B.away?.sacksAllowed??'-'}</td><td>${B.home?.sacksAllowed??'-'}</td></tr>
+  <tr><td>Penalties</td><td>${B.away?.penalties??'-'}-${B.away?.penaltyYds??'-'}</td><td>${B.home?.penalties??'-'}-${B.home?.penaltyYds??'-'}</td></tr>
+  <tr><td>Return yards</td><td>${(B.away?.kickReturnYds||0)+(B.away?.puntReturnYds||0)}</td><td>${(B.home?.kickReturnYds||0)+(B.home?.puntReturnYds||0)}</td></tr></table></div></div>
+  <div class="grid">${gameStatSections(A,g)}${gameStatSections(H,g)}</div>
+  <div class="card"><h3>Play-by-play</h3><div class="log">${(g.events||[]).map(e=>h(eventText(e))).join('<br>')}</div></div>`;
+  wirePlayerLinks();
+}
+function renderUniverse(){ app.innerHTML=`<div class="card"><h2>Universe</h2><p>${h(universe.name)}</p><label>Active league <select id="leagueSelect">${universe.leagues.map(l=>`<option value="${l.id}" ${l.id===universe.activeLeagueId?'selected':''}>${h(l.name)} (${l.season})</option>`).join('')}</select></label></div><div class="card"><h3>Save & League Tools</h3><div class="actions"><button id="addLeague">Add League</button><button id="saveNow">Save Now</button><button id="exportSave">Export Save</button><button id="importSave">Import Save</button><button id="reset">Reset Universe</button></div><p class="muted">${storageAvailable?'This browser allows automatic local saves.':'iOS local-file mode blocks automatic browser storage here. The game still works for this session; use Export Save before closing and Import Save when you return.'}</p><textarea id="saveBox" style="width:100%;min-height:120px;margin-top:10px;background:#0d1525;color:#f3f4f6;border:1px solid #3b4a66;border-radius:8px;padding:10px;box-sizing:border-box" placeholder="Exported save data appears here. Paste save data here to import."></textarea></div>`;
+ document.querySelector('#leagueSelect').onchange=e=>{universe.activeLeagueId=e.target.value;persist();render();};
+ document.querySelector('#addLeague').onclick=()=>{createLeague(universe,{name:`Arena League ${universe.leagues.length+1}`,teamCount:4});persist();render();};
+ document.querySelector('#saveNow').onclick=()=>persist();
+ document.querySelector('#exportSave').onclick=()=>{const box=document.querySelector('#saveBox');box.value=exportSave();box.focus();box.select();saveStatus.textContent='Save exported';};
+ document.querySelector('#importSave').onclick=()=>{const box=document.querySelector('#saveBox');try{importSave(box.value);saveStatus.textContent='Save imported';}catch(e){alert(e.message);}};
+ document.querySelector('#reset').onclick=()=>{if(confirm('Delete this universe?')){clearSave();universe=createUniverse();createLeague(universe,{name:'Arena Football League',teamCount:4});persist();render();}};
+}
+function simGame(g,rerender=true){ if(!g||g.played)return; const l=league(),H=l.teams.find(t=>t.id===g.homeId),A=l.teams.find(t=>t.id===g.awayId); const res=simulateGame(H,A,l.rules,{seed:g.seed}); recordResult(l,g,res); selectedGameId=g.id; persist(); if(rerender){view='game';render();} }
+window.AFGM_DEV={runSimulationSelfTests,runLeagueLifecycleSelfTest,runRulesVariantSelfTest,runCareerWorldSelfTest,validateSchedule,simulateGame,normalizeRules,DEFAULT_RULES};
+saveStatus.textContent=storageAvailable?'Ready · auto-save on':'Ready · session save';
+render();
+</script>
+</body>
+</html>
